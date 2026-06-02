@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/compose.production.yml"
 COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+REQUESTED_MAIL_MANAGER_IMAGE="${MAIL_MANAGER_IMAGE:-}"
 
 generate_password() {
   openssl rand -base64 18 | tr -d '\n'
@@ -30,6 +31,10 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   # shellcheck disable=SC1091
   source "$ROOT_DIR/.env"
   set +a
+fi
+
+if [[ -n "$REQUESTED_MAIL_MANAGER_IMAGE" ]]; then
+  MAIL_MANAGER_IMAGE="$REQUESTED_MAIL_MANAGER_IMAGE"
 fi
 
 : "${MAIL_MANAGER_IMAGE:?MAIL_MANAGER_IMAGE must be set}"

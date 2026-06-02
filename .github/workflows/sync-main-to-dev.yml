@@ -29,14 +29,24 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Fetch target branches
+        id: fetch-branches
         run: |
-          git fetch origin main dev
+          git fetch origin main
+          if git ls-remote --exit-code --heads origin dev >/dev/null; then
+            git fetch origin dev
+            echo "has_dev=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No remote dev branch found. Skipping main-to-dev sync."
+            echo "has_dev=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Merge main into dev
+        if: ${{ steps.fetch-branches.outputs.has_dev == 'true' }}
         run: |
           git checkout -B dev origin/dev
           git merge --no-ff --no-edit origin/main
 
       - name: Push dev branch
+        if: ${{ steps.fetch-branches.outputs.has_dev == 'true' }}
         run: |
           git push origin dev
