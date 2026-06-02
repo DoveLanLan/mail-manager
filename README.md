@@ -49,23 +49,23 @@ admin123
 
 ```bash
 # 拉取最新镜像
-docker pull ghcr.io/assast/outlookemail:latest
+docker pull ghcr.io/dovelanlan/mail-manager:latest
 
 # 运行容器
 docker run -d \
-  --name outlook-mail-reader \
+  --name mail-manager \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
   -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/assast/outlookemail:latest
+  ghcr.io/dovelanlan/mail-manager:latest
 ```
 
 ### 方式四：使用 Python 直接运行
 
 ```bash
-git clone https://github.com/assast/outlookEmail.git
-cd outlookEmail
+git clone https://github.com/DoveLanLan/mail-manager.git
+cd mail-manager
 pip install -r requirements.txt
 export SECRET_KEY=your-secret-key-here
 python web_outlook_app.py
@@ -83,9 +83,9 @@ python web_outlook_app.py
 ```yaml
 version: '3.8'
 services:
-  outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
-    container_name: outlook-mail-reader
+  mail-manager:
+    image: ghcr.io/dovelanlan/mail-manager:latest
+    container_name: mail-manager
     ports:
       - "5000:5000"
     volumes:
@@ -115,9 +115,9 @@ docker-compose up -d
 ```yaml
 version: '3.8'
 services:
-  outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
-    container_name: outlook-mail-reader
+  mail-manager:
+    image: ghcr.io/dovelanlan/mail-manager:latest
+    container_name: mail-manager
     ports:
       - "5000:5000"
     volumes:
@@ -128,7 +128,7 @@ services:
       - SECRET_KEY=your-secret-key-here
       - FLASK_ENV=production
       - DOCKER_UPDATE_ENABLED=true
-      - DOCKER_UPDATE_CONTAINER=outlook-mail-reader
+      - DOCKER_UPDATE_CONTAINER=mail-manager
       # 可选：在较新的 Docker daemon / socket 代理环境中显式指定 API 版本
       # - DOCKER_UPDATE_API_VERSION=1.52
       # 可选：让界面 OAuth 助手使用你自己的 Azure 应用
@@ -589,8 +589,8 @@ https://support.google.com/mail/answer/185833?hl=zh-Hans
 欢迎提交 Issue 和 Pull Request！
 
 ```bash
-git clone https://github.com/assast/outlookEmail.git
-cd outlookEmail
+git clone https://github.com/DoveLanLan/mail-manager.git
+cd mail-manager
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

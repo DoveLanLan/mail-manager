@@ -20,23 +20,23 @@
 
 ```bash
 # 拉取最新镜像
-docker pull ghcr.io/assast/outlookemail:latest
+docker pull ghcr.io/dovelanlan/mail-manager:latest
 
 # 运行容器
 docker run -d \
-  --name outlook-mail-reader \
+  --name mail-manager \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
   -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/assast/outlookemail:latest
+  ghcr.io/dovelanlan/mail-manager:latest
 
 # 查看日志
-docker logs -f outlook-mail-reader
+docker logs -f mail-manager
 
 # 停止容器
-docker stop outlook-mail-reader
-docker rm outlook-mail-reader
+docker stop mail-manager
+docker rm mail-manager
 ```
 
 **首次启动会自动：**
@@ -49,8 +49,8 @@ docker rm outlook-mail-reader
 
 ```bash
 # 克隆仓库
-git clone https://github.com/assast/outlookEmail.git
-cd outlookEmail
+git clone https://github.com/DoveLanLan/mail-manager.git
+cd mail-manager
 
 # 安装依赖
 pip install -r requirements.txt
@@ -85,9 +85,9 @@ gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-4} ...
 version: '3.8'
 
 services:
-  outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
-    container_name: outlook-mail-reader
+  mail-manager:
+    image: ghcr.io/dovelanlan/mail-manager:latest
+    container_name: mail-manager
     ports:
       - "5000:5000"
     volumes:
@@ -169,10 +169,11 @@ ports:
 
 ### 可用镜像标签
 
-- `ghcr.io/assast/outlookemail:latest` - 默认分支最近一次符合条件的稳定构建
-- `ghcr.io/assast/outlookemail:main` - `main` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:dev` - `dev` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:vX.Y.Z` - 指定正式版本镜像，由手动发版工作流生成
+- `ghcr.io/dovelanlan/mail-manager:latest` - 默认分支最近一次符合条件的稳定构建
+- `ghcr.io/dovelanlan/mail-manager:main` - `main` 分支最近一次符合条件的构建
+- `ghcr.io/dovelanlan/mail-manager:dev` - `dev` 分支最近一次符合条件的构建
+- `ghcr.io/dovelanlan/mail-manager:sha-<commit>` - 指定提交镜像，由生产部署工作流使用
+- `ghcr.io/dovelanlan/mail-manager:vX.Y.Z` - 指定正式版本镜像，由手动发版工作流生成
 
 补充说明：
 
@@ -183,7 +184,7 @@ ports:
 ### 更新镜像
 
 ```bash
-docker pull ghcr.io/assast/outlookemail:latest
+docker pull ghcr.io/dovelanlan/mail-manager:latest
 docker-compose down
 docker-compose up -d
 ```
@@ -191,13 +192,13 @@ docker-compose up -d
 ### 自己构建镜像（可选）
 
 ```bash
-docker build -t outlook-mail-reader .
+docker build -t mail-manager .
 docker run -d \
-  --name outlook-mail-reader \
+  --name mail-manager \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
-  outlook-mail-reader
+  mail-manager
 ```
 
 ## 生产环境部署
@@ -209,7 +210,7 @@ docker run -d \
 sudo apt install nginx certbot python3-certbot-nginx -y
 ```
 
-**2. 配置 Nginx** `/etc/nginx/sites-available/outlook-mail-reader`
+**2. 配置 Nginx** `/etc/nginx/sites-available/mail-manager`
 ```nginx
 server {
     listen 80;
@@ -232,7 +233,7 @@ server {
 
 **3. 启用配置**
 ```bash
-sudo ln -s /etc/nginx/sites-available/outlook-mail-reader /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/mail-manager /etc/nginx/sites-enabled/
 sudo nginx -t
 sudo systemctl reload nginx
 ```

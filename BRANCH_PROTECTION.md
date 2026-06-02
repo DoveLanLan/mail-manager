@@ -67,6 +67,8 @@ Current repository policy implemented in Actions:
   - `Dockerfile`
   - `.dockerignore`
   - `templates/**`
+  - `static/**`
+  - `deploy/**`
   - workflow file changes
 - It does **not** trigger for README / changelog / release-doc-only edits
 
