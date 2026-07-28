@@ -37,6 +37,7 @@
 | --- | --- | --- | --- | --- |
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
+| POST | `/api/external/outlook/upload` | API Key | JSON | 上传 Outlook 邮箱账号密码到上传表（默认未授权，支持单条/批量） |
 
 ### 分组、账号、标签、项目
 
@@ -54,12 +55,20 @@
 | POST | `/api/accounts/export-selected` | Session + CSRF | `text/plain` 下载 | 导出选中分组或选中账号 |
 | GET | `/api/accounts` | Session | JSON | 获取账号列表 |
 | GET | `/api/accounts/search` | Session | JSON | 搜索账号 |
-| GET | `/api/accounts/<account_id>` | Session | JSON | 获取单个账号 |
+| GET | `/api/accounts/<account_id>` | Session | JSON | 获取单个账号，不返回账号密码和 IMAP 密码明文 |
+| POST | `/api/accounts/<account_id>/secrets` | Session + CSRF | JSON | 二次验证后获取账号密码和 IMAP 密码 |
 | POST | `/api/accounts` | Session + CSRF | JSON | 批量导入账号 |
 | PUT | `/api/accounts/<account_id>` | Session + CSRF | JSON | 更新账号 |
+| POST | `/api/accounts/<account_id>/reauthorize` | Session + CSRF | JSON | 重新授权已有 Outlook 账号并自动刷新验证 |
+| GET | `/api/outlook-upload-accounts` | Session | JSON | 分页查询 Outlook 自动化授权上传账号，批量返回表格显示用明文密码 |
+| POST | `/api/outlook-upload-accounts` | Session + CSRF | JSON | 新增 Outlook 自动化授权上传账号（可带 group_id / tag_ids / proxy_url） |
+| PUT | `/api/outlook-upload-accounts/<account_id>` | Session + CSRF | JSON | 修改上传账号邮箱、密码或备注 |
+| DELETE | `/api/outlook-upload-accounts/<account_id>` | Session + CSRF | JSON | 删除上传账号 |
+| POST | `/api/outlook-upload-accounts/batch-delete` | Session + CSRF | JSON | 批量删除上传账号 |
 | DELETE | `/api/accounts/<account_id>` | Session + CSRF | JSON | 按 ID 删除账号 |
 | DELETE | `/api/accounts/email/<email_addr>` | Session + CSRF | JSON | 按邮箱删除账号 |
 | POST | `/api/accounts/batch-delete` | Session + CSRF | JSON | 批量删除账号 |
+| POST | `/api/accounts/batch-outlook-auto-auth` | Session + CSRF | JSON | 批量将正式 Outlook 账号加入自动授权队列 |
 | GET | `/api/accounts/<account_id>/aliases` | Session | JSON | 获取账号别名 |
 | PUT | `/api/accounts/<account_id>/aliases` | Session + CSRF | JSON | 整体替换账号别名 |
 | POST | `/api/accounts/batch-update-group` | Session + CSRF | JSON | 批量改分组 |
@@ -119,8 +128,15 @@
 | POST | `/api/temp-emails/batch-delete` | Session + CSRF | JSON | 批量删除临时邮箱 |
 | POST | `/api/temp-emails/tags` | Session + CSRF | JSON | 批量改临时邮箱标签 |
 | GET | `/api/duckmail/domains` | Session | JSON | 获取 DuckMail 域名 |
-| GET | `/api/cloudflare/domains` | Session | JSON | 获取 Cloudflare 域名 |
+| GET | `/api/cloudflare/channels` | Session | JSON | 获取 Cloudflare 渠道列表 |
+| POST | `/api/cloudflare/channels` | Session + CSRF | JSON | 创建 Cloudflare 渠道 |
+| PUT | `/api/cloudflare/channels/<id>` | Session + CSRF | JSON | 更新 Cloudflare 渠道 |
+| DELETE | `/api/cloudflare/channels/<id>` | Session + CSRF | JSON | 删除未被临时邮箱引用的 Cloudflare 渠道 |
+| GET | `/api/cloudflare/domains` | Session | JSON | 获取指定 Cloudflare 渠道域名 |
 | POST | `/api/temp-emails/generate` | Session + CSRF | JSON | 生成临时邮箱 |
+| POST | `/api/temp-emails/generate-batch` | Session + CSRF | JSON | 批量生成 Cloudflare 临时邮箱 |
+| POST | `/api/cloudflare/ai-usernames/test` | Session + CSRF | JSON | 使用草稿配置测试 AI 用户名生成 |
+| POST | `/api/cloudflare/ai-usernames/generate` | Session + CSRF | JSON | 使用已保存配置生成 Cloudflare 用户名列表 |
 | DELETE | `/api/temp-emails/<email_addr>` | Session + CSRF | JSON | 删除临时邮箱 |
 | GET | `/api/temp-emails/<email_addr>/messages` | Session | JSON | 获取临时邮箱邮件列表 |
 | GET | `/api/temp-emails/<email_addr>/messages/<message_id>` | Session | JSON | 获取临时邮件详情 |
@@ -133,6 +149,12 @@
 | GET | `/api/settings` | Session | JSON | 获取系统设置 |
 | PUT | `/api/settings` | Session + CSRF | JSON | 更新系统设置 |
 | POST | `/api/settings/test-forward-channel` | Session + CSRF | JSON | 直接测试转发渠道 |
+| GET | `/api/skins` | Session | JSON | 获取系统级外观皮肤列表与当前皮肤 |
+| POST | `/api/skins/<skin_id>/activate` | Session + CSRF | JSON | 启用指定皮肤 |
+| POST | `/api/skins/upload` | Session + CSRF | JSON | 上传 zip 皮肤包 |
+| POST | `/api/skins/git/install` | Session + CSRF | JSON | 从 Git 仓库安装皮肤 |
+| POST | `/api/skins/<skin_id>/git/update` | Session + CSRF | JSON | 更新 Git 来源皮肤 |
+| DELETE | `/api/skins/<skin_id>` | Session + CSRF | JSON | 删除未启用的自定义皮肤 |
 
 ## 认证
 
@@ -190,6 +212,30 @@ X-CSRFToken: <csrf-token>
 Cookie: session=<session-cookie>
 ```
 
+### 账号密码二次验证
+
+`GET /api/accounts/<account_id>` 只返回 `has_password` 和 `has_imap_password` 标记，不返回账号密码或 IMAP 密码明文。需要展示密码时，调用 `POST /api/accounts/<account_id>/secrets` 并在 JSON 请求体中传入当前 Web 登录密码。`field` 可选值为 `password` 或 `imap_password`，用于只获取当前要展示的密码字段；不传 `field` 时兼容返回两个字段：
+
+```json
+{
+  "password": "web-login-password",
+  "field": "password"
+}
+```
+
+验证成功后返回：
+
+```json
+{
+  "success": true,
+  "secrets": {
+    "password": "account-password"
+  }
+}
+```
+
+更新账号时，如果请求体省略 `password` 或 `imap_password` 字段，后端会保留已有值；只有显式传入该字段时才会更新对应密码。
+
 ### 通用响应约定
 
 绝大多数 JSON 接口都遵循下面的约定：
@@ -208,15 +254,19 @@ Cookie: session=<session-cookie>
 ```json
 {
   "code": "IMAP_CONNECT_FAILED",
-  "message": "IMAP 连接失败",
+  "reason_code": "MAIL_NETWORK_FAILED",
+  "message": "网络连接失败：无法连接邮件服务，请检查 DNS、防火墙、代理和服务地址",
   "type": "IMAPConnectError",
   "status": 502,
   "details": "",
-  "trace_id": "..."
+  "trace_id": "...",
+  "category": "network",
+  "proxy_configured": false,
+  "retryable": true
 }
 ```
 
-AI 客户端应优先判断 `success`，再兼容 `error` 既可能是字符串，也可能是对象。
+其中 `code` 保持原有接口错误码，`reason_code` 提供更细的代理、超时、TLS 或网络失败原因。AI 客户端应优先判断 `success`，再兼容 `error` 既可能是字符串，也可能是对象。
 
 ### GET `/api/csrf-token`
 
@@ -313,7 +363,7 @@ AI 客户端应优先判断 `success`，再兼容 `error` 既可能是字符串�
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `group_id` | int | 否 | 仅返回指定分组下的账号 |
+| `group_id` | int | 否 | 仅返回指定分组直属账号；不会递归包含子分组 |
 | `limit` | int | 否 | 单页条数，最大 `10000`；不传时保持兼容，返回全部匹配账号 |
 | `offset` | int | 否 | 分页偏移量，默认 `0` |
 | `sort_by` | string | 否 | 排序字段，支持 `created_at`、`email`、`sort_order` |
@@ -461,18 +511,187 @@ curl -H "X-API-Key: your-api-key" \
 
 如果使用回退候选命中，响应会包含 `resolved_query_email`、`fallback_used`、`fallback_email` 等字段。
 
+### POST `/api/external/outlook/upload`
+
+上传 Outlook 邮箱账号和密码，保存到独立的上传暂存表 `outlook_upload_accounts`。入库记录的"是否授权"字段默认值为未授权（`is_authorized = 0`）。支持一次上传单条或批量。
+
+> 说明：该接口仅负责存储，不触发授权流程；上传的密码会加密存储，接口响应不会回显密码。
+
+#### 请求体
+
+单条：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 是 | 邮箱账号，入库前转小写并去除首尾空格；重复将被跳过 |
+| `password` | string | 是 | 邮箱密码 |
+| `remark` | string | 否 | 备注 |
+
+批量（与上面二选一）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `accounts` | array | 是 | 元素为 `{email, password, remark?}` 的数组；非空时按批量处理 |
+
+#### 请求示例
+
+```bash
+# 单条
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"email":"user@outlook.com","password":"pwd123","remark":"可选"}' \
+  "http://localhost:5000/api/external/outlook/upload"
+
+# 批量
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"accounts":[{"email":"a@outlook.com","password":"p1"},{"email":"b@outlook.com","password":"p2"}]}' \
+  "http://localhost:5000/api/external/outlook/upload"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "total": 2,
+  "added": 1,
+  "duplicate": 1,
+  "invalid": 0,
+  "results": [
+    { "email": "a@outlook.com", "status": "added", "id": 5 },
+    { "email": "b@outlook.com", "status": "duplicate" }
+  ]
+}
+```
+
+#### 返回说明
+
+- `total` / `added` / `duplicate` / `invalid`：本次处理总数与各状态计数
+- `results[].status` 取值：
+  - `added`：新增成功，附带 `id`
+  - `duplicate`：`email` 已存在，被跳过（不覆盖原记录）
+  - `invalid`：`email` 缺少 `@` 或 `password` 为空，未入库
+- 上传密码加密存储，响应不回显 `password`
+- 入库记录 `is_authorized` 一律为 `0`（未授权）
+- 请求体既无 `email` 也无非空 `accounts` 时返回 HTTP 400
+- 缺少 / 无效 API Key 时由鉴权层返回 HTTP 401 / 403
+
+### Outlook 上传账号管理
+
+这些接口用于 Web 管理端维护 `outlook_upload_accounts` 中的 Outlook 自动化授权账号。
+
+安全约束：
+
+- 后端保留加密后的邮箱密码。
+- 列表响应批量返回 `password` 明文，供管理端表格小眼睛切换显示/隐藏。
+- 新增/修改响应不返回 `password` 明文。
+- 前端使用 `has_password` / `password_length` 判断是否已保存密码，并使用 `password` 执行表格内显示切换。
+
+#### GET `/api/outlook-upload-accounts`
+
+分页查询上传账号。
+
+查询参数：
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `page` | integer | 否 | 页码，默认 `1` |
+| `page_size` | integer | 否 | 每页数量，API 默认 `20`，最大 `1000`；管理端默认 `20`，提供 `10`、`20`、`50`、`100` 档位 |
+| `keyword` | string | 否 | 按邮箱或备注模糊搜索 |
+| `auth_status` | string | 否 | 授权状态：`all`（默认）、`authorized`、`unauthorized`；未知值按 `all` 处理 |
+
+`keyword` 和 `auth_status` 同时传入时按 AND 组合筛选，响应中的 `total` 和 `total_pages` 基于组合筛选后的结果计算。
+
+响应中的 `items[]` 包含已解密的 `password` 字段；`proxy_url` 是暂存记录保存的账号级代理，不包含分组继承代理，列表序列化时会移除 URL 中的用户名、密码、路径和查询参数；`tags` 来源于同邮箱正式账号在 `account_tags` / `tags` 中绑定的标签，尚未匹配正式账号时为空数组：
+
+```json
+{
+  "success": true,
+  "items": [
+    {
+      "id": 42,
+      "email": "user@outlook.com",
+      "password": "secret",
+      "has_password": true,
+      "password_length": 6,
+      "is_authorized": false,
+      "status": "active",
+      "remark": "note",
+      "source": "external_api",
+      "group_id": 1,
+      "proxy_url": "socks5://host:1080",
+      "tag_ids": [1],
+      "tags": [
+        {
+          "id": 1,
+          "name": "重点",
+          "color": "#0078d4",
+          "created_at": "2026-07-06 12:00:00"
+        }
+      ],
+      "created_at": "2026-07-06 12:00:00",
+      "updated_at": "2026-07-06 12:00:00"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 20,
+  "total_pages": 1
+}
+```
+
+#### POST `/api/outlook-upload-accounts`
+
+新增单个上传账号。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 是 | 邮箱地址，入库前转小写并去除首尾空格 |
+| `password` | string | 是 | 邮箱密码，加密存储 |
+| `remark` | string | 否 | 备注 |
+| `group_id` | int | 否 | 授权成功并新建正式账号时写入的目标分组；默认 `1` |
+| `tag_ids` | int[] / string | 否 | 新建正式账号时附加的标签 ID 列表 |
+| `proxy_url` | string | 否 | 新建正式账号时写入的账号代理（不含回退代理） |
+
+重复邮箱返回 HTTP 400，响应不会回显密码。字段 `group_id` / `tag_ids` / `proxy_url` 会保存在暂存表；仅当 Graph 授权成功并**新建**正式账号时应用，更新已有正式账号时仍只覆盖授权字段。
+
+#### PUT `/api/outlook-upload-accounts/<account_id>`
+
+修改上传账号。请求体字段都可选：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 否 | 非空时更新邮箱；修改后 `is_authorized` 重置为 `0` |
+| `password` | string | 否 | 非空时更新密码；修改后 `is_authorized` 重置为 `0` |
+| `remark` | string | 否 | 更新备注；只改备注不改变 `is_authorized` |
+
+`password` 省略或传空字符串表示保留原密码。重复邮箱返回 HTTP 400，账号不存在返回 HTTP 404。
+
+#### DELETE `/api/outlook-upload-accounts/<account_id>`
+
+删除上传账号。账号不存在返回 HTTP 404。
+
+#### POST `/api/outlook-upload-accounts/batch-delete`
+
+批量删除上传账号。请求体：
+
+```json
+{ "account_ids": [1, 2, 3] }
+```
+
+成功响应包含 `deleted` / `not_found` 计数。
+
 ## 内部 API
 
 ## 分组管理
 
 | 方法 | 路径 | 参数 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/api/groups` | 无 | 获取所有分组，返回 `account_count`、`sort_position` |
+| GET | `/api/groups` | 无 | 获取所有分组，返回 `parent_id`、`level`、`account_count`、`descendant_account_count`、`sort_position` |
 | GET | `/api/groups/<group_id>` | 路径参数 `group_id` | 获取单个分组详情 |
-| POST | `/api/groups` | JSON: `name`、`description?`、`color?`、`proxy_url?`、`sort_position?` | 创建分组 |
-| PUT | `/api/groups/<group_id>` | JSON: `name`、`description?`、`color?`、`proxy_url?`、`sort_position?` | 更新分组 |
-| DELETE | `/api/groups/<group_id>` | 路径参数 `group_id` | 删除分组，默认分组不能删除 |
-| PUT | `/api/groups/reorder` | JSON: `group_ids: number[]` | 重新排序普通分组 |
+| POST | `/api/groups` | JSON: `name`、`description?`、`color?`、`proxy_url?`、`sort_position?`、`parent_id?` | 创建分组 |
+| PUT | `/api/groups/<group_id>` | JSON: `name`、`description?`、`color?`、`proxy_url?`、`sort_position?`、`parent_id?` | 更新分组或移动父级 |
+| DELETE | `/api/groups/<group_id>` | 路径参数 `group_id` | 删除分组；含子分组时级联删除子分组并把账号移回默认分组 |
+| PUT | `/api/groups/reorder` | JSON: `group_ids: number[]`、`parent_id?` | 重新排序同一父级下的普通分组 |
 
 创建或更新分组请求示例：
 
@@ -482,13 +701,22 @@ curl -H "X-API-Key: your-api-key" \
   "description": "走香港代理",
   "color": "#1a1a1a",
   "proxy_url": "http://127.0.0.1:7890",
-  "sort_position": 2
+  "sort_position": 2,
+  "parent_id": null
 }
 ```
 
+分组支持最多三级树形层级：
+
+- `parent_id=null` 表示一级分组；指定一级分组为父级会创建二级分组，指定二级分组为父级会创建三级分组。
+- 三级分组下不能再创建子分组；临时邮箱分组不能作为父分组，也不能被移动到其他分组下。
+- `sort_position` 只在同一 `parent_id` 下生效，`PUT /api/groups/reorder` 也只重排同一父级的 `group_ids`。
+- `account_count` 是当前分组直属账号数，`descendant_account_count` 是当前分组及所有后代分组账号数。
+- 删除父分组会删除所有后代分组，并把被删除分组中的普通邮箱账号移动到默认分组。
+
 ## 导出与二次验证
 
-导出接口都会先校验一次登录密码，拿到 `verify_token` 后再发起导出。`verify_token` 当前为一次性令牌，默认 5 分钟内有效。
+导出接口都会先校验一次登录密码，拿到 `verify_token` 后再发起导出。`verify_token` 当前为一次性令牌，默认 5 分钟内有效。按分组导出时会包含该分组及所有子分组账号；同时传入父子分组时，账号只会导出一次。
 
 | 方法 | 路径 | 参数 | 返回 |
 | --- | --- | --- | --- |
@@ -524,7 +752,7 @@ curl -H "X-API-Key: your-api-key" \
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `group_id` | int | 否 | 仅返回指定分组下的账号 |
+| `group_id` | int | 否 | 返回指定分组及所有子分组下的账号 |
 
 #### 响应重点字段
 
@@ -556,7 +784,7 @@ curl -H "X-API-Key: your-api-key" \
 | `offset` | int | 否 | 分页偏移量，默认 `0` |
 | `sort_by` | string | 否 | 排序字段，支持 `created_at`、`email`、`sort_order` |
 | `sort_order` | string | 否 | 排序方向，`asc` 或 `desc`，默认 `desc` |
-| `group_id` | int | 否 | 仅搜索指定分组下的账号，不传则搜索全部分组 |
+| `group_id` | int | 否 | 仅搜索指定分组及所有子分组下的账号，不传则搜索全部分组 |
 | `tag_ids` | string | 否 | 逗号分隔的标签 ID，仅搜索包含任一标签的账号 |
 | `include_untagged` | bool | 否 | 与 `tag_ids` 配合使用，是否包含未打标签账号 |
 
@@ -620,6 +848,8 @@ curl -H "X-API-Key: your-api-key" \
 
 获取单个账号详情。
 
+账号详情不会返回 `password` 或 `imap_password` 明文，只返回 `has_password` 和 `has_imap_password` 标记。需要查看已保存的账号密码时，必须调用 `POST /api/accounts/<account_id>/secrets` 并传入当前 Web 登录密码完成二次验证。
+
 #### 响应补充字段
 
 ```json
@@ -628,6 +858,10 @@ curl -H "X-API-Key: your-api-key" \
   "account": {
     "id": 1,
     "email": "user@outlook.com",
+    "has_password": true,
+    "has_imap_password": false,
+    "client_id": "xxx",
+    "refresh_token": "xxx",
     "aliases": ["alias@example.com", "login@example.com"],
     "alias_count": 2,
     "matched_alias": "",
@@ -636,6 +870,31 @@ curl -H "X-API-Key: your-api-key" \
     "fallback_proxy_url_1": "direct",
     "fallback_proxy_url_2": "",
     "proxy_override_enabled": true
+  }
+}
+```
+
+#### 查看密码
+
+```http
+POST /api/accounts/1/secrets
+Content-Type: application/json
+```
+
+```json
+{
+  "password": "web-login-password",
+  "field": "password"
+}
+```
+
+`field` 可选值为 `password` 或 `imap_password`；不传 `field` 时兼容返回两个密码字段。验证通过后返回：
+
+```json
+{
+  "success": true,
+  "secrets": {
+    "password": "account-password"
   }
 }
 ```
@@ -692,6 +951,129 @@ curl -H "X-API-Key: your-api-key" \
 }
 ```
 
+### POST `/api/accounts/<account_id>/reauthorize`
+
+为已有 Outlook OAuth 账号重新授权。该接口只支持 Outlook 账号，不支持 IMAP 账号。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `redirected_url` | string | 是 | Microsoft 授权完成后浏览器地址栏中的完整回调 URL |
+
+接口会从 `redirected_url` 解析授权码，向 Microsoft 换取新的 Refresh Token，随后只更新目标账号的 `client_id`、加密后的 `refresh_token`、`refresh_token_updated_at` 和刷新状态字段。邮箱、密码、分组、状态、转发、代理、备注、别名、标签等字段不会被该接口修改。
+
+授权信息保存成功后，接口会清理旧的刷新失败错误，并立即触发一次单账号 Token 刷新验证。响应中的 `success` 表示授权信息已保存；`validation.success` 表示自动刷新验证是否通过。
+
+请求示例：
+
+```json
+{
+  "redirected_url": "http://localhost:8080/?code=..."
+}
+```
+
+刷新验证成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "重新授权成功，Token 刷新验证通过",
+  "authorization_updated": true,
+  "validation": {
+    "success": true,
+    "status": "success",
+    "message": "Token 刷新成功"
+  }
+}
+```
+
+刷新验证失败响应示例：
+
+```json
+{
+  "success": true,
+  "message": "重新授权已保存，但自动刷新验证失败",
+  "authorization_updated": true,
+  "validation": {
+    "success": false,
+    "status": "failed",
+    "error": {
+      "code": "TOKEN_REFRESH_FAILED",
+      "message": "Token 刷新失败",
+      "type": "RefreshTokenError",
+      "status": 400
+    },
+    "error_message": "Graph 刷新失败: ..."
+  }
+}
+```
+
+常见错误：
+
+- `ACCOUNT_NOT_FOUND`: 账号不存在
+- `ACCOUNT_REAUTH_UNSUPPORTED`: IMAP 账号不支持重新授权
+- `OAUTH_EXCHANGE_FAILED`: 回调 URL 无效或 Microsoft 换取 Token 失败
+- `ACCOUNT_REAUTH_SAVE_FAILED`: 新授权信息保存失败
+
+### POST `/api/accounts/<account_id>/outlook-auto-auth`
+
+将已有 Outlook 正式账号加入 Outlook 自动化授权队列。该接口从服务端读取正式账号的邮箱和密码，写入 `outlook_upload_accounts` 暂存表，不返回明文密码。仅支持 Outlook 账号，不支持 IMAP 账号。
+
+该接口不会立即启动 Graph 自动化授权任务；用户仍需在 Outlook 自动化授权弹窗中执行授权。对同邮箱已存在暂存记录会覆盖密码并重置为未授权状态。
+
+请求体：无需参数。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "已加入自动授权",
+  "upload_account_id": 42,
+  "email": "user@outlook.com",
+  "status": "added"
+}
+```
+
+`status` 取值：
+
+- `added`: 新增了暂存记录
+- `updated`: 覆盖了已有暂存记录（重新入队）
+
+常见错误：
+
+- `ACCOUNT_NOT_FOUND` (404): 账号不存在
+- `ACCOUNT_AUTO_AUTH_UNSUPPORTED` (400): IMAP 账号不支持加入 Outlook 自动化授权
+- `ACCOUNT_PASSWORD_MISSING` (400): 账号密码为空或无法解密
+- `ACCOUNT_AUTO_AUTH_INVALID` (400): 邮箱或密码无效
+
+> **安全约束**：该接口不会在响应中返回密码。密码仅从服务端保存的加密数据中读取并加密写入暂存表。
+
+加入自动授权时会同步复制正式账号的 `group_id`、标签与 `proxy_url` 到暂存表，便于后续若需新建正式账号时使用。
+
+### POST `/api/accounts/batch-outlook-auto-auth`
+
+批量将正式 Outlook 账号加入自动化授权队列。请求体：
+
+```json
+{ "account_ids": [1, 2, 3] }
+```
+
+逐个复用单账号加入逻辑：跳过 IMAP / 无密码账号并计入 `failed`。响应示例：
+
+```json
+{
+  "success": true,
+  "message": "已处理 3 个账号：新增 2，重新入队 0，失败 1",
+  "total": 3,
+  "added": 2,
+  "updated": 0,
+  "failed": 1,
+  "results": []
+}
+```
+
 ### POST `/api/accounts/batch-update-group`
 
 批量修改账号分组。
@@ -738,12 +1120,14 @@ curl -H "X-API-Key: your-api-key" \
 
 批量设置或清空账号级代理。账号级代理三项全空时，该账号会继续继承所属分组代理；任一项非空时，账号级配置优先于分组配置。
 
+代理 URL 可包含字面量 `{mail}`：出站时按账号邮箱 local-part（仅保留字母数字并小写）展开；存储与 API 回显保持原始模板字符串。推荐 `socks5h://outlook.{mail}:TOKEN@host:2260` 等形式对接 Resin 等粘性代理。
+
 #### 请求体
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `account_ids` | array<int> | 是 | 账号 ID 列表 |
-| `proxy_url` | string | 否 | 账号级主代理，支持 `direct` / `直连` |
+| `proxy_url` | string | 否 | 账号级主代理，支持 `direct` / `直连` 与 `{mail}` 模板 |
 | `fallback_proxy_url_1` | string | 否 | 回退代理 1 |
 | `fallback_proxy_url_2` | string | 否 | 回退代理 2 |
 
@@ -934,7 +1318,7 @@ curl -H "X-API-Key: your-api-key" \
 | `project_key` | string | 是 | 项目标识，内部会转成小写并去掉首尾空格 |
 | `name` | string | 否 | 项目名称。首次创建时不传则默认使用 `project_key` |
 | `description` | string | 否 | 项目描述 |
-| `group_ids` | array<int> | 否 | 项目范围分组列表；不传时首次创建默认为全量邮箱范围 |
+| `group_ids` | array<int> | 否 | 项目范围分组列表；会包含每个分组及其所有子分组账号；不传时首次创建默认为全量邮箱范围 |
 | `use_alias_email` | bool | 否 | 是否优先把别名邮箱加入项目；默认 `false` |
 
 #### 请求示例
@@ -1014,7 +1398,7 @@ curl -H "X-API-Key: your-api-key" \
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `status` | string | 否 | 按项目状态过滤，如 `toClaim`、`failed`、`done` |
-| `group_id` | int | 否 | 按当前分组或项目来源分组过滤 |
+| `group_id` | int | 否 | 按当前分组或项目来源分组过滤；会包含该分组及所有子分组 |
 | `provider` | string | 否 | 按邮箱 provider 过滤 |
 | `keyword` | string | 否 | 在邮箱地址、备注里做模糊搜索 |
 
@@ -1308,8 +1692,8 @@ curl -H "X-API-Key: your-api-key" \
 
 - `q`
 - `status=all|success|failed|never`
-- `page`
-- `page_size`
+- `page`：最小为 `1`
+- `page_size`：最小为 `1`，最大为 `10000`
 
 ### 转发日志与触发
 
@@ -1406,6 +1790,7 @@ curl -H "X-API-Key: your-api-key" \
 | `date` | string | 收件时间 |
 | `body` | string | 邮件正文 |
 | `body_type` | string | `html` 或 `text` |
+| `has_attachments` | bool | 是否有附件 |
 | `attachments` | array<object> | 附件列表 |
 
 `attachments` 中每个对象包含：
@@ -1538,9 +1923,26 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 
 ### POST `/api/emails/delete`
 
-批量删除邮件。
+批量删除邮件（永久删除）。
 
 #### 请求体
+
+```json
+{
+  "email": "user@outlook.com",
+  "method": "graph",
+  "folder": "inbox",
+  "items": [
+    {
+      "id": "AAMk...",
+      "folder": "inbox",
+      "id_mode": "graph"
+    }
+  ]
+}
+```
+
+兼容旧格式：
 
 ```json
 {
@@ -1551,8 +1953,10 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 
 说明：
 
-- Outlook 账号会优先走 Graph API，失败后按逻辑回退 IMAP
-- IMAP 账号当前不支持批量删除
+- 推荐传 `items`（含 `id` / `folder` / `id_mode`）与 `method`，与 `/api/emails/mark-read` 一致
+- Outlook 账号按 `id_mode`/`method` 分流：`graph` 走 Graph API，`uid`/`sequence` 走 OAuth IMAP
+- 标准 IMAP 账号通过 IMAP `STORE \\Deleted` + `EXPUNGE` 永久删除
+- 仍接受仅传 `ids` 的旧客户端；此时默认按 Graph 处理
 
 ## 临时邮箱
 
@@ -1561,17 +1965,26 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | 方法 | 路径 | 参数 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/api/temp-emails` | 无 | 获取所有临时邮箱，列表项包含 `tags` 字段 |
-| POST | `/api/temp-emails/import` | JSON: `account_string`、`provider` | 批量导入临时邮箱 |
+| POST | `/api/temp-emails/import` | JSON: `account_string`、`provider`、`tag_ids?` | 批量导入临时邮箱；Cloudflare 导入成功的邮箱可同步绑定标签 |
 | POST | `/api/temp-emails/batch-delete` | JSON: `temp_email_ids` | 批量删除临时邮箱 |
 | GET | `/api/duckmail/domains` | 无 | 获取 DuckMail 可用域名 |
-| GET | `/api/cloudflare/domains` | 无 | 获取 Cloudflare 可用域名 |
-| GET | `/api/cloudflare/messages` | Query: `limit?`、`offset?`、`address?` | 使用 Cloudflare 管理员接口查看当前 Worker 全部邮件，可选按收件地址过滤 |
+| GET | `/api/cloudflare/channels` | 无 | 获取 Cloudflare 渠道列表 |
+| POST | `/api/cloudflare/channels` | JSON: 渠道配置 | 创建 Cloudflare 渠道 |
+| PUT | `/api/cloudflare/channels/<id>` | JSON: 渠道配置 | 更新 Cloudflare 渠道 |
+| DELETE | `/api/cloudflare/channels/<id>` | 无 | 删除未被引用的 Cloudflare 渠道 |
+| POST | `/api/cloudflare/channels/<id>/test` | 无 | 测试 Cloudflare 渠道管理员 API 连接 |
+| GET | `/api/cloudflare/domains` | Query: `channel_id` | 获取指定 Cloudflare 渠道可用域名 |
+| GET | `/api/cloudflare/messages` | Query: `channel_id?`、`limit?`、`offset?`、`address?` | 使用指定或默认 Cloudflare 渠道的管理员接口查看该渠道全部邮件，可选按收件地址过滤 |
+| POST | `/api/temp-emails/import-cloudflare-addresses` | JSON: `cloudflare_channel_id`、`tag_ids?`、`page_size?`、`stream?` | 从指定 Cloudflare 渠道自动拉取地址列表导入，通过管理员 API 管理；`stream=true` 时返回 Server-Sent Events 流式进度 |
+| POST | `/api/temp-emails/generate-batch` | JSON: `provider=cloudflare`、`count`、`channel_id?`、`domain?`、`usernames?`、`tag_ids?` | 批量生成 Cloudflare 临时邮箱，通过管理员 API 管理 |
+| POST | `/api/cloudflare/ai-usernames/test` | JSON: AI 草稿配置、`count` | 使用未保存或已保存的配置测试 AI 用户名生成 |
+| POST | `/api/cloudflare/ai-usernames/generate` | JSON: `count` | 使用已保存且启用的 AI 配置生成严格等量用户名 |
 
 `/api/temp-emails/import` 的导入格式：
 
 - `provider=gptmail`: 每行一个邮箱
 - `provider=duckmail`: 每行 `邮箱----密码`
-- `provider=cloudflare`: 每行 `邮箱----JWT`
+- `provider=cloudflare`: 每行一个邮箱地址，使用请求中的 `cloudflare_channel_id` 绑定渠道；所有 Cloudflare 邮箱统一通过渠道管理员 API 管理，不再使用 JWT；兼容旧格式 `邮箱----JWT`，会自动提取邮箱部分
 
 ### POST `/api/temp-emails/generate`
 
@@ -1583,7 +1996,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | --- | --- | --- |
 | `gptmail` | `prefix?`、`domain?` | 不传则走默认随机生成 |
 | `duckmail` | `domain`、`username`、`password` | 用户名至少 3 位，密码至少 6 位 |
-| `cloudflare` | `domain?`、`username?` | `username` 可留空随机生成 |
+| `cloudflare` | `channel_id`、`domain?`、`username?` | `channel_id` 指定 Cloudflare 渠道；`username` 可留空随机生成 |
 
 #### 请求示例
 
@@ -1595,6 +2008,87 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
   "password": "secret123"
 }
 ```
+
+### POST `/api/temp-emails/generate-batch`
+
+批量生成 Cloudflare 临时邮箱。当前仅支持 `provider=cloudflare`。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `provider` | string | 是 | 固定为 `cloudflare` |
+| `count` | int | 是 | 创建数量，范围 `1-50` |
+| `channel_id` | int/string | 否 | Cloudflare 渠道 ID；不传时使用默认渠道 |
+| `domain` | string | 否 | 指定邮箱域名；不传时使用渠道第一个域名 |
+| `usernames` | array<string> | 否 | 显式用户名列表。空或不传时随机生成；非空时清洗后数量必须等于 `count`，且不能重复 |
+| `tag_ids` | array<int> | 否 | 为成功创建的临时邮箱绑定存在的标签 |
+
+用户名清洗规则：转小写；含 `@` 时取 `@` 前缀；删除所有非 `a-z0-9` 字符；清洗后长度必须至少 3；最多保留 32 个字符。
+
+#### 请求示例
+
+```json
+{
+  "provider": "cloudflare",
+  "channel_id": 1,
+  "domain": "mail.example.com",
+  "count": 3,
+  "usernames": ["alpha", "beta@example.com", "sales.ops"],
+  "tag_ids": [2, 5]
+}
+```
+
+#### 成功或部分成功响应示例
+
+```json
+{
+  "success": true,
+  "emails": [
+    "alpha@mail.example.com",
+    "beta@mail.example.com"
+  ],
+  "created_count": 2,
+  "failed_count": 1,
+  "failures": [
+    {
+      "index": 3,
+      "username": "salesops",
+      "error": "upstream rejected"
+    }
+  ],
+  "tagged_count": 2,
+  "message": "已创建 2 个 Cloudflare 临时邮箱"
+}
+```
+
+如果全部创建失败，`success=false`，并返回第一个失败原因到 `error`。
+
+### POST `/api/cloudflare/ai-usernames/test`
+
+使用草稿配置测试 AI 用户名生成，不创建邮箱、不保存生成结果。可用于设置页保存前测试。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `api_url` | string | 是 | OpenAI-compatible API 地址；可传基础 `/v1` 地址，后端会补 `/chat/completions` |
+| `model` | string | 是 | 模型名称 |
+| `api_key` | string | 否 | AI API Key；省略时尝试使用已保存密钥 |
+| `prompt` | string | 否 | 提示词模板，支持 `{count}` 和 `{seed}` |
+| `count` | int | 否 | 期望数量，范围 `1-50`，默认 `5` |
+
+### POST `/api/cloudflare/ai-usernames/generate`
+
+使用已保存且已启用的 Cloudflare AI 用户名配置生成用户名列表。该接口只返回用户名，不创建邮箱、不绑定标签。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `count` | int | 是 | 期望数量，范围 `1-50` |
+
+该接口要求 AI 原始返回数量和清洗后的数量都严格等于 `count`。数量不足、过多、重复或清洗后无效都会返回 `success=false`，不会随机补齐或截断。
 
 ### 临时邮箱邮件接口
 
@@ -1609,19 +2103,43 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 
 `GET /messages` 与 `POST /refresh` 都会返回统一结构的 `emails` 列表。`POST /refresh` 还会包含 `new_count`，表示本次新保存的邮件数量。
 
+### Cloudflare 渠道管理
+
+Cloudflare Temp Email 支持多渠道配置。每个渠道包含 `name`、`worker_domain`、`email_domains`、`admin_password`、`enabled`、`is_default`。`email_domains` 可选，留空时渠道仍可保存但不能在生成邮箱时自动选择域名；管理员密码只在保存时提交；列表响应只返回 `admin_password_configured`。
+
+创建渠道：
+
+```http
+POST /api/cloudflare/channels
+```
+
+```json
+{
+  "name": "cfmail-us",
+  "worker_domain": "cfmail-us.example.workers.dev",
+  "email_domains": "mail-us.example.com, alt-us.example.com",
+  "admin_password": "ADMIN_PASSWORD",
+  "enabled": true,
+  "is_default": true
+}
+```
+
+更新已有渠道时 `admin_password` 可留空，表示保留原密码；`email_domains` 也可留空，域名查询接口会返回成功响应和空列表。删除渠道前系统会检查是否仍有 Cloudflare 临时邮箱引用该渠道；被引用的渠道不能删除，可以先停用。
+
 ### GET `/api/cloudflare/messages`
 
-查看当前配置的 Cloudflare Temp Email Worker 全部邮件。该接口需要 Web 登录 session，不使用对外 API Key；它不同于普通邮箱的 `folder=all`，后者只聚合某个普通邮箱账号的收件箱和垃圾邮件。
+查看指定 Cloudflare 渠道 Worker 的全部邮件；未传 `channel_id` 时使用默认 Cloudflare 渠道。该接口需要 Web 登录 session，不使用对外 API Key；它不同于普通邮箱的 `folder=all`，后者只聚合某个普通邮箱账号的收件箱和垃圾邮件。本接口不提供跨 Cloudflare 渠道聚合视图。
 
 #### 查询参数
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
+| `channel_id` | int | 否 | Cloudflare 渠道 ID；不传时使用默认渠道 |
 | `limit` | int | 否 | 返回数量，默认 `50`，最大 `100` |
 | `offset` | int | 否 | 分页偏移，默认 `0` |
-| `address` | string | 否 | 收件地址过滤；不传时查看 Worker 全部邮件 |
+| `address` | string | 否 | 收件地址过滤；不传时查看该渠道 Worker 全部邮件 |
 
-当 `address` 是 `@gmail.com` 或 `@googlemail.com`，且第一次地址过滤查询成功但返回 0 封邮件时，会自动用另一个后缀重试。响应中的 `requested_email`、`queried_email`、`fallback_used` 会说明实际查询地址。
+当 `address` 是 `@gmail.com` 或 `@googlemail.com`，且第一次地址过滤查询成功但返回 0 封邮件时，会在同一渠道内自动用另一个后缀重试。响应中的 `channel_id`、`channel_name`、`requested_email`、`queried_email`、`fallback_used` 会说明实际查询范围和地址。
 
 #### 成功响应示例
 
@@ -1629,6 +2147,8 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 {
   "success": true,
   "method": "Cloudflare Admin",
+  "channel_id": 1,
+  "channel_name": "cfmail-us",
   "requested_email": "user@gmail.com",
   "queried_email": "user@googlemail.com",
   "fallback_used": true,
@@ -1659,6 +2179,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | --- | --- | --- | --- |
 | GET | `/api/oauth/auth-url` | 无 | 生成 Microsoft OAuth 授权链接 |
 | POST | `/api/oauth/exchange-token` | JSON: `redirected_url` | 从回调 URL 中解析 `code` 并换取 Refresh Token |
+| POST | `/api/accounts/<account_id>/reauthorize` | JSON: `redirected_url` | 为已有 Outlook 账号重新授权并自动刷新验证 |
 
 换取 Token 请求示例：
 
@@ -1667,6 +2188,8 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
   "redirected_url": "http://localhost:8080/?code=..."
 }
 ```
+
+注意：Microsoft 授权码通常只能使用一次。为已有账号重新授权时，应直接调用 `/api/accounts/<account_id>/reauthorize`，不要先调用 `/api/oauth/exchange-token` 预览后再重复提交同一个回调 URL。
 
 ## 设置接口
 
@@ -1697,14 +2220,28 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `external_api_key` | 当前对外 API Key |
 | `duckmail_base_url` | DuckMail API 地址 |
 | `duckmail_api_key` | DuckMail API Key |
-| `cloudflare_worker_domain` | Cloudflare Worker 域名 |
-| `cloudflare_email_domains` | Cloudflare 邮箱域名列表，逗号分隔字符串 |
-| `cloudflare_admin_password` | Cloudflare 管理密码 |
+| `cloudflare_worker_domain` | 旧单渠道 Cloudflare Worker 域名，主要用于升级迁移 |
+| `cloudflare_email_domains` | 旧单渠道 Cloudflare 邮箱域名列表，主要用于升级迁移 |
+| `cloudflare_admin_password` | 旧单渠道 Cloudflare 管理密码，主要用于升级迁移 |
+| `cloudflare_ai_username_enabled` | 是否启用 Cloudflare AI 用户名生成 |
+| `cloudflare_ai_username_api_url` | Cloudflare AI 用户名生成 API 地址 |
+| `cloudflare_ai_username_model` | Cloudflare AI 用户名生成模型 |
+| `cloudflare_ai_username_prompt` | Cloudflare AI 用户名生成提示词模板 |
+| `cloudflare_ai_username_api_key_configured` | 是否已保存 Cloudflare AI API Key |
+| `cloudflare_ai_username_api_key_masked` | Cloudflare AI API Key 掩码，不返回明文 |
 | `app_timezone` | 当前系统时区，IANA 时区名，例如 `Asia/Shanghai` |
 | `show_account_created_at` | 是否在邮箱列表展示创建时间 |
 | `show_account_sort_order` | 是否在邮箱列表展示自定义排序值 |
+| `active_skin_id` | 当前实际生效皮肤 ID；配置不可用时会返回 `classic` |
+| `configured_skin_id` | 当前保存的皮肤 ID；可能因为皮肤不可用而与 `active_skin_id` 不同 |
+| `active_skin` | 当前实际生效皮肤对象 |
+| `active_skin_asset_hash` | 当前皮肤 CSS 资源版本，用于刷新 `/assets/active-skin.css` |
 | `forward_channels` | 当前启用的转发渠道 |
-| `forward_check_interval_minutes` | 转发检查间隔 |
+| `forward_check_interval_seconds` | 转发轮询间隔秒数 |
+| `forward_check_interval_minutes` | 兼容旧客户端的转发检查间隔分钟数 |
+| `forward_execution_mode` | 转发执行模式，`serial` 或 `parallel` |
+| `forward_parallel_workers` | 并行模式 worker 数 |
+| `forward_account_delay_seconds` | 串行模式下账号间隔秒数；并行模式返回 `0` |
 | `forward_email_window_minutes` | 转发时间窗口 |
 | `forward_include_junkemail` | 是否转发垃圾箱 |
 | `email_forward_recipient` | SMTP 转发收件人 |
@@ -1718,6 +2255,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `smtp_use_ssl` | 是否启用 SSL |
 | `telegram_bot_token` | Telegram Bot Token |
 | `telegram_chat_id` | Telegram Chat ID |
+| `telegram_topic_id` | Telegram Topic ID（可选，话题群组的 message_thread_id） |
 | `normal_mail_local_retention_enabled` | 是否启用普通邮箱本地保留 |
 
 ### PUT `/api/settings`
@@ -1728,7 +2266,8 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `login_password` | string | 登录密码，至少 8 位 |
+| `login_password` | string | 新登录密码，至少 8 位；提交时必须同时提供 `current_login_password` |
+| `current_login_password` | string | 当前登录密码；修改 `login_password` 时必填，用于二次确认 |
 | `gptmail_api_key` | string | GPTMail API Key |
 | `refresh_interval_days` | int | 刷新周期，范围 `1-90` |
 | `refresh_delay_seconds` | int | 刷新间隔秒数，范围 `0-60` |
@@ -1738,8 +2277,11 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `app_timezone` | string | 系统时区，使用 IANA 时区名，例如 `Asia/Shanghai` |
 | `show_account_created_at` | bool | 是否在邮箱列表展示创建时间 |
 | `show_account_sort_order` | bool | 是否在邮箱列表展示自定义排序值 |
+| `active_skin_id` | string | 当前系统级外观皮肤 ID；所有登录设备共用同一设置 |
 | `external_api_key` | string | 对外 API Key，可传空字符串清空 |
 | `normal_mail_local_retention_enabled` | bool/string | 是否启用普通邮箱本地保留；通过 `/api/settings` 更新会同步刷新后端进程内读取缓存 |
+
+说明：修改 `login_password` 时必须提供正确的 `current_login_password`；改密成功后服务端会轮换登录会话版本，其他已登录的 Web Session 需要重新登录，当前改密会话保持有效。
 
 #### 临时邮箱服务相关字段
 
@@ -1747,18 +2289,28 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | --- | --- | --- |
 | `duckmail_base_url` | string | DuckMail API 地址 |
 | `duckmail_api_key` | string | DuckMail API Key |
-| `cloudflare_worker_domain` | string | Cloudflare Worker 域名 |
-| `cloudflare_email_domains` | string | Cloudflare 邮箱域名，逗号分隔 |
-| `cloudflare_admin_password` | string | Cloudflare 管理密码 |
+| `cloudflare_worker_domain` | string | 旧单渠道 Cloudflare Worker 域名；新配置请使用 `/api/cloudflare/channels` |
+| `cloudflare_email_domains` | string | 旧单渠道 Cloudflare 邮箱域名；新配置请使用 `/api/cloudflare/channels` |
+| `cloudflare_admin_password` | string | 旧单渠道 Cloudflare 管理密码；新配置请使用 `/api/cloudflare/channels` |
+| `cloudflare_ai_username_enabled` | bool/string | 是否启用 Cloudflare AI 用户名生成 |
+| `cloudflare_ai_username_api_url` | string | OpenAI-compatible API 地址 |
+| `cloudflare_ai_username_model` | string | 模型名称 |
+| `cloudflare_ai_username_prompt` | string | 提示词模板，支持 `{count}` 和 `{seed}` |
+| `cloudflare_ai_username_api_key` | string | AI API Key；非空时加密保存，空字符串会保留已有值 |
+| `cloudflare_ai_username_clear_api_key` | bool | 传 `true` 时清空已保存的 AI API Key |
 
 #### 转发与 SMTP / Telegram 相关字段
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `forward_check_interval_minutes` | int | 轮询间隔，范围 `1-60` |
+| `forward_check_interval_seconds` | int | 轮询间隔秒数，范围 `20-3600` |
+| `forward_check_interval_minutes` | int | 兼容旧客户端的轮询间隔分钟数，范围 `1-60`；未同时传 seconds 时会同步写入秒级配置 |
+| `forward_execution_mode` | string | `serial` 或 `parallel`；保存为 `parallel` 时账号间隔会归零 |
+| `forward_parallel_workers` | int | 并行模式 worker 数，范围 `1-10` |
+| `forward_account_delay_seconds` | int | 串行模式下账号间隔，范围 `0-60`；并行模式会保存为 `0` |
 | `forward_email_window_minutes` | int | 转发邮件时间范围，范围 `0-10080`，`0` 表示不限制 |
 | `forward_include_junkemail` | bool | 是否把垃圾箱邮件也纳入转发轮询 |
-| `forward_channels` | array<string> | `smtp` / `telegram` |
+| `forward_channels` | array<string> | `smtp` / `telegram` / `wecom` |
 | `email_forward_recipient` | string | SMTP 转发收件人 |
 | `smtp_host` | string | SMTP 主机 |
 | `smtp_port` | int | SMTP 端口 |
@@ -1770,17 +2322,198 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `smtp_use_ssl` | bool | 是否启用 SSL |
 | `telegram_bot_token` | string | Telegram Bot Token |
 | `telegram_chat_id` | string | Telegram Chat ID |
+| `telegram_topic_id` | string | Telegram Topic ID（可选，话题群组的 message_thread_id，纯数字） |
 
 #### 请求示例
 
 ```json
 {
-  "forward_check_interval_minutes": 5,
+  "forward_check_interval_seconds": 20,
+  "forward_execution_mode": "parallel",
+  "forward_parallel_workers": 4,
+  "forward_account_delay_seconds": 0,
   "forward_email_window_minutes": 30,
   "forward_include_junkemail": true,
   "smtp_provider": "outlook",
   "forward_channels": ["smtp", "telegram"]
 }
+```
+
+### GET `/api/skins`
+
+获取系统级外观皮肤列表、当前配置值和当前实际生效皮肤。该接口要求已登录。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "configured_skin_id": "midnight-sample",
+  "active_skin_id": "midnight-sample",
+  "asset_hash": "a1b2c3d4e5f6a7b8",
+  "active_skin": {
+    "id": "midnight-sample",
+    "name": "Midnight Sample",
+    "version": "1.0.0",
+    "source_type": "upload",
+    "builtin": false,
+    "active": true,
+    "status": "ok",
+    "asset_hash": "a1b2c3d4e5f6a7b8",
+    "last_error": ""
+  },
+  "skins": []
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `configured_skin_id` | `settings` 表中保存的皮肤 ID |
+| `active_skin_id` | 当前实际生效的皮肤 ID；配置不可用时会回退为 `classic` |
+| `asset_hash` | 当前皮肤 CSS 版本，可作为 `/assets/active-skin.css?v=...` 参数 |
+| `skins` | 已安装皮肤列表，始终包含内置 `classic` |
+
+皮肤对象常见字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 皮肤 ID |
+| `name` | 显示名称 |
+| `version` | 版本 |
+| `description` | 描述 |
+| `source_type` | `builtin`、`upload` 或 `git` |
+| `builtin` | 是否内置皮肤 |
+| `active` | 是否当前实际生效 |
+| `status` | `ok` 或 `invalid` |
+| `last_error` | 最近一次校验或读取错误 |
+| `git_url` | Git 来源地址，仅 Git 来源皮肤返回 |
+| `git_ref` | Git ref，仅 Git 来源皮肤返回 |
+
+### POST `/api/skins/<skin_id>/activate`
+
+启用指定皮肤。该设置是系统级设置，保存后所有登录设备都会使用同一当前皮肤。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "皮肤已启用",
+  "active_skin": {
+    "id": "classic",
+    "source_type": "builtin",
+    "active": false,
+    "status": "ok"
+  },
+  "asset_hash": "classic"
+}
+```
+
+失败时常见错误：
+
+- `皮肤 ID 无效`
+- `皮肤不存在`
+- `皮肤不可用`
+
+也可以通过 `PUT /api/settings` 提交 `active_skin_id` 达到同样效果。
+
+### POST `/api/skins/upload`
+
+上传 zip 皮肤包。表单字段名支持 `skin` 或 `file`。
+
+请求示例：
+
+```bash
+curl -X POST \
+  -H "X-CSRFToken: <csrf-token>" \
+  -b "session=<session-cookie>" \
+  -F "skin=@skin.zip" \
+  "http://localhost:5000/api/skins/upload"
+```
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "皮肤已安装",
+  "skin": {
+    "id": "midnight-sample",
+    "name": "Midnight Sample",
+    "version": "1.0.0",
+    "source_type": "upload",
+    "status": "ok"
+  }
+}
+```
+
+格式要求见 [`docs/skins.md`](skins.md)。上传失败不会改变当前启用皮肤。
+
+### POST `/api/skins/git/install`
+
+从 Git 仓库安装皮肤。仓库根目录必须包含 `skin.json` 和 CSS 入口文件。
+
+请求示例：
+
+```json
+{
+  "git_url": "https://github.com/user/outlook-skin.git",
+  "git_ref": "main"
+}
+```
+
+说明：
+
+- `git_url` 必填。
+- `git_ref` 可选，可以是分支、tag 或其他 `git clone --branch` 可解析的 ref。
+- 运行环境必须安装 `git`。
+- 私有仓库凭据没有专门管理入口，不建议把凭据直接写进多人可见的 URL。
+
+成功响应与上传接口一致。安装失败不会改变当前启用皮肤。
+
+### POST `/api/skins/<skin_id>/git/update`
+
+更新已安装的 Git 来源皮肤。服务端会使用该皮肤保存的 `git_url` 和 `git_ref` 重新拉取，并要求更新后的 `skin.json.id` 与原皮肤 ID 一致。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "Git 皮肤已更新",
+  "skin": {
+    "id": "midnight-sample",
+    "source_type": "git",
+    "status": "ok"
+  }
+}
+```
+
+更新失败时不会覆盖现有皮肤文件。
+
+### DELETE `/api/skins/<skin_id>`
+
+删除未启用的自定义皮肤。不能删除内置 `classic`，也不能直接删除当前启用的皮肤；需要先切换到其他皮肤或 `classic`。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "皮肤已删除"
+}
+```
+
+### GET `/assets/active-skin.css`
+
+返回当前实际生效皮肤的 CSS。该资源用于页面加载，不要求 Session；配置不可用或 CSS 读取失败时返回空的 classic fallback CSS。
+
+客户端可使用 `GET /api/skins` 或 `GET /api/settings` 返回的 `asset_hash` / `active_skin_asset_hash` 作为查询参数刷新缓存：
+
+```txt
+/assets/active-skin.css?v=<asset_hash>
 ```
 
 ### GET `/api/settings/normal-mail-retention/status`
@@ -1862,7 +2595,8 @@ Telegram 测试：
   "config": {
     "telegram": {
       "bot_token": "123:abc",
-      "chat_id": "123456"
+      "chat_id": "123456",
+      "topic_id": "789"
     }
   }
 }
@@ -1872,14 +2606,14 @@ Telegram 测试：
 
 ### 代理使用
 
-账号邮箱相关 API 当前会优先使用账号级代理配置；账号 `proxy_url`、`fallback_proxy_url_1`、`fallback_proxy_url_2` 三项全空时，才继承账号所属分组的代理配置：
+账号邮箱相关 API 当前会优先使用账号级代理配置；账号 `proxy_url`、`fallback_proxy_url_1`、`fallback_proxy_url_2` 三项全空时，才继承账号所属分组的代理配置。若当前分组未配置代理，会继续向上查找父级分组代理，直到找到有代理配置的祖先分组或到达一级分组：
 
 - Graph token 获取
 - Graph 邮件列表
 - Graph 邮件详情
 - Outlook OAuth IMAP token 获取
-- Outlook OAuth IMAP 列表 / 详情 / 删除回退
-- 密码型 IMAP 列表 / 详情
+- Outlook OAuth IMAP 列表 / 详情 / 删除
+- 密码型 IMAP 列表 / 详情 / 删除
 - 转发轮询抓信 / 详情抓取
 
 ### 别名冲突规则

@@ -17,36 +17,214 @@ def get_cloudflare_admin_password() -> str:
 
 # ==================== 分组操作 ====================
 
+MAX_GROUP_LEVEL = 3
+DEFAULT_GROUP_ID = 1
+TEMP_GROUP_NAME = '临时邮箱'
+_UNSET_PARENT = object()
+
+
+def normalize_group_parent_id(parent_id: Any) -> Optional[int]:
+    if parent_id in (None, ''):
+        return None
+    try:
+        value = int(parent_id)
+    except (TypeError, ValueError):
+        raise ValueError('父分组无效')
+    return value if value > 0 else None
+
+
+def is_temp_group_row(group: Optional[Dict]) -> bool:
+    return bool(group and (group.get('name') == TEMP_GROUP_NAME or int(group.get('is_system') or 0) == 1))
+
+
+def is_default_group_row(group: Optional[Dict]) -> bool:
+    return bool(group and int(group.get('id') or 0) == DEFAULT_GROUP_ID)
+
+
+def group_has_proxy_config(group_row: Optional[Dict[str, Any]]) -> bool:
+    if not group_row:
+        return False
+    return any([
+        str(group_row.get('proxy_url', '') or '').strip(),
+        str(group_row.get('fallback_proxy_url_1', '') or '').strip(),
+        str(group_row.get('fallback_proxy_url_2', '') or '').strip(),
+    ])
+
+
 def load_groups() -> List[Dict]:
-    """加载所有分组（临时邮箱分组排在最前面）"""
+    """加载所有分组（临时邮箱分组排在最前面）。"""
     db = get_db()
     cursor = db.execute('''
         SELECT * FROM groups
         ORDER BY
             CASE WHEN name = '临时邮箱' THEN 0 ELSE 1 END,
+            level,
+            CASE WHEN parent_id IS NULL THEN 0 ELSE parent_id END,
             sort_order,
             id
     ''')
-    rows = cursor.fetchall()
-    return [dict(row) for row in rows]
+    groups = [dict(row) for row in cursor.fetchall()]
+    for group in groups:
+        group['descendant_account_count'] = get_group_account_count(group['id'], recursive=True)
+    return groups
 
 
-def get_group_by_id(group_id: int) -> Optional[Dict]:
+def get_group_by_id(group_id: int, db=None) -> Optional[Dict]:
     """根据 ID 获取分组"""
-    db = get_db()
-    cursor = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,))
+    database = db or get_db()
+    cursor = database.execute('SELECT * FROM groups WHERE id = ?', (group_id,))
     row = cursor.fetchone()
     return dict(row) if row else None
 
 
-def get_movable_group_ids(db=None, exclude_group_id: Optional[int] = None) -> List[int]:
-    """获取可排序分组 ID 列表（不含临时邮箱）"""
+def get_child_groups(parent_id: Optional[int], db=None) -> List[Dict]:
+    """获取指定父分组下的直接子分组。"""
+    database = db or get_db()
+    if parent_id is None:
+        rows = database.execute('''
+            SELECT * FROM groups
+            WHERE parent_id IS NULL
+            ORDER BY
+                CASE WHEN name = '临时邮箱' THEN 0 ELSE 1 END,
+                sort_order,
+                id
+        ''').fetchall()
+    else:
+        rows = database.execute('''
+            SELECT * FROM groups
+            WHERE parent_id = ?
+            ORDER BY sort_order, id
+        ''', (parent_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_descendant_group_ids(group_id: int, db=None) -> List[int]:
+    """返回分组自身及所有后代分组 ID，顺序为深度优先。"""
+    database = db or get_db()
+    root = database.execute('SELECT id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not root:
+        return []
+
+    descendant_ids: List[int] = []
+
+    def visit(current_group_id: int) -> None:
+        descendant_ids.append(current_group_id)
+        child_rows = database.execute('''
+            SELECT id FROM groups
+            WHERE parent_id = ?
+            ORDER BY sort_order, id
+        ''', (current_group_id,)).fetchall()
+        for child_row in child_rows:
+            visit(int(child_row['id']))
+
+    visit(int(group_id))
+    return descendant_ids
+
+
+def get_max_subtree_depth(group_id: int, db=None) -> int:
+    """计算从当前分组开始的最大子树深度；叶子分组为 1。"""
+    database = db or get_db()
+    if not database.execute('SELECT id FROM groups WHERE id = ?', (group_id,)).fetchone():
+        return 0
+
+    child_rows = database.execute('SELECT id FROM groups WHERE parent_id = ?', (group_id,)).fetchall()
+    if not child_rows:
+        return 1
+    return 1 + max(get_max_subtree_depth(int(row['id']), database) for row in child_rows)
+
+
+def validate_group_parent_for_create(parent_id: Optional[int], db=None) -> tuple[bool, str, int]:
+    """校验新分组父级并返回将要写入的 level。"""
+    database = db or get_db()
+    if parent_id is None:
+        return True, '', 1
+
+    parent = database.execute('SELECT * FROM groups WHERE id = ?', (parent_id,)).fetchone()
+    if not parent:
+        return False, '父分组不存在', 1
+    parent_dict = dict(parent)
+    if is_temp_group_row(parent_dict):
+        return False, '临时邮箱分组不可作为父分组', 1
+
+    parent_level = int(parent_dict.get('level') or 1)
+    if parent_level >= MAX_GROUP_LEVEL:
+        return False, '已达到最大层级深度', parent_level + 1
+    return True, '', parent_level + 1
+
+
+def validate_group_move(group_id: int, target_parent_id: Optional[int], db=None) -> tuple[bool, str]:
+    """校验移动后层级深度不超过 3，并避免循环引用。"""
+    database = db or get_db()
+    group = database.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return False, '分组不存在'
+    group_dict = dict(group)
+    try:
+        current_parent_id = normalize_group_parent_id(group_dict.get('parent_id'))
+    except ValueError:
+        current_parent_id = None
+    # 父级未变视为未移动：允许编辑名称/代理等字段（编辑弹窗总会提交 parent_id）
+    if current_parent_id == target_parent_id:
+        return True, ''
+    if is_default_group_row(group_dict):
+        return False, '默认分组不可移动'
+    if is_temp_group_row(group_dict):
+        return False, '临时邮箱分组不可移动'
+
+    if target_parent_id == group_id:
+        return False, '不能将分组移动到自身下'
+
+    descendant_ids = get_descendant_group_ids(group_id, database)
+    if target_parent_id is not None and target_parent_id in descendant_ids:
+        return False, '不能将分组移动到自身或子分组下'
+
+    valid_parent, parent_error, target_level = validate_group_parent_for_create(target_parent_id, database)
+    if not valid_parent:
+        return False, parent_error
+
+    subtree_depth = get_max_subtree_depth(group_id, database)
+    if target_level + subtree_depth - 1 > MAX_GROUP_LEVEL:
+        return False, '移动后层级深度将超过 3 级'
+    return True, ''
+
+
+def rebuild_group_levels(group_id: int, db=None) -> None:
+    """从指定分组开始，按 parent_id 级联修正子树 level。"""
+    database = db or get_db()
+    row = database.execute('SELECT id, parent_id, level FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not row:
+        return
+
+    if row['parent_id'] is None:
+        target_level = 1
+    else:
+        parent = database.execute('SELECT level FROM groups WHERE id = ?', (row['parent_id'],)).fetchone()
+        target_level = int(parent['level'] or 1) + 1 if parent else 1
+
+    target_level = max(1, min(MAX_GROUP_LEVEL, target_level))
+    if int(row['level'] or 1) != target_level:
+        database.execute('UPDATE groups SET level = ? WHERE id = ?', (target_level, group_id))
+
+    for child in database.execute('SELECT id FROM groups WHERE parent_id = ? ORDER BY sort_order, id', (group_id,)).fetchall():
+        rebuild_group_levels(int(child['id']), database)
+
+
+def get_movable_group_ids(db=None, exclude_group_id: Optional[int] = None,
+                          parent_id: Optional[int] = None) -> List[int]:
+    """获取同一父级下可排序分组 ID 列表（不含临时邮箱）。"""
     database = db or get_db()
     query = '''
         SELECT id FROM groups
-        WHERE name != '临时邮箱'
+        WHERE name != ?
+          AND COALESCE(is_system, 0) = 0
+          AND id != ?
     '''
-    params = []
+    params: List[Any] = [TEMP_GROUP_NAME, DEFAULT_GROUP_ID]
+    if parent_id is None:
+        query += ' AND parent_id IS NULL'
+    else:
+        query += ' AND parent_id = ?'
+        params.append(parent_id)
     if exclude_group_id is not None:
         query += ' AND id != ?'
         params.append(exclude_group_id)
@@ -55,23 +233,28 @@ def get_movable_group_ids(db=None, exclude_group_id: Optional[int] = None) -> Li
     return [row['id'] for row in cursor.fetchall()]
 
 
-def apply_group_order(group_ids: List[int], db=None) -> None:
-    """按给定顺序写入分组排序"""
+def apply_group_order(group_ids: List[int], db=None, parent_id: Optional[int] = None) -> None:
+    """按给定顺序写入同一父级下的分组排序。"""
     database = db or get_db()
     for index, group_id in enumerate(group_ids, start=1):
         database.execute('UPDATE groups SET sort_order = ? WHERE id = ?', (index, group_id))
 
-    temp_group = database.execute(
-        "SELECT id FROM groups WHERE name = '临时邮箱' LIMIT 1"
-    ).fetchone()
-    if temp_group:
-        database.execute('UPDATE groups SET sort_order = 0 WHERE id = ?', (temp_group['id'],))
+    if parent_id is None:
+        temp_group = database.execute(
+            "SELECT id FROM groups WHERE name = ? LIMIT 1",
+            (TEMP_GROUP_NAME,)
+        ).fetchone()
+        if temp_group:
+            database.execute('UPDATE groups SET sort_order = 0, parent_id = NULL, level = 1 WHERE id = ?', (temp_group['id'],))
 
 
 def normalize_group_order(db=None) -> None:
-    """归一化分组顺序"""
+    """归一化所有父级下的分组顺序。"""
     database = db or get_db()
-    apply_group_order(get_movable_group_ids(database), database)
+    parent_rows = database.execute('SELECT DISTINCT parent_id FROM groups').fetchall()
+    for row in parent_rows:
+        parent_id = row['parent_id']
+        apply_group_order(get_movable_group_ids(database, parent_id=parent_id), database, parent_id)
 
 
 def clamp_group_position(sort_position: Optional[int], max_position: int) -> int:
@@ -84,45 +267,64 @@ def clamp_group_position(sort_position: Optional[int], max_position: int) -> int
 
 
 def get_group_sort_position(group_id: int, db=None) -> Optional[int]:
-    """获取分组在可排序列表中的位置（从 1 开始）"""
-    group_ids = get_movable_group_ids(db)
+    """获取分组在同父级可排序列表中的位置（从 1 开始）。"""
+    database = db or get_db()
+    group = database.execute('SELECT parent_id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return None
+    group_ids = get_movable_group_ids(database, parent_id=group['parent_id'])
     try:
         return group_ids.index(group_id) + 1
     except ValueError:
         return None
 
 
-def set_group_position(group_id: int, sort_position: Optional[int], db=None) -> bool:
-    """设置分组在可排序列表中的位置"""
+def set_group_position(group_id: int, sort_position: Optional[int], db=None,
+                       parent_id: Any = _UNSET_PARENT) -> bool:
+    """设置分组在同父级可排序列表中的位置。"""
     database = db or get_db()
-    group = database.execute('SELECT id, name FROM groups WHERE id = ?', (group_id,)).fetchone()
-    if not group or group['name'] == '临时邮箱':
+    group = database.execute('SELECT id, name, is_system, parent_id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return False
+    if is_default_group_row(dict(group)):
+        return True
+    if is_temp_group_row(dict(group)):
         return False
 
-    group_ids = get_movable_group_ids(database, exclude_group_id=group_id)
+    target_parent_id = group['parent_id'] if parent_id is _UNSET_PARENT else parent_id
+    group_ids = get_movable_group_ids(database, exclude_group_id=group_id, parent_id=target_parent_id)
     target_position = clamp_group_position(sort_position, len(group_ids) + 1)
     group_ids.insert(target_position - 1, group_id)
-    apply_group_order(group_ids, database)
+    apply_group_order(group_ids, database, target_parent_id)
     return True
 
 
 def add_group(name: str, description: str = '', color: str = '#1a1a1a',
               proxy_url: str = '', fallback_proxy_url_1: str = '',
-              fallback_proxy_url_2: str = '', sort_position: Optional[int] = None) -> Optional[int]:
+              fallback_proxy_url_2: str = '', sort_position: Optional[int] = None,
+              parent_id: Optional[int] = None) -> Optional[int]:
     """添加分组"""
     db = get_db()
     try:
+        normalized_parent_id = normalize_group_parent_id(parent_id)
+        valid_parent, _, level = validate_group_parent_for_create(normalized_parent_id, db)
+        if not valid_parent:
+            return None
         cursor = db.execute(
             '''
             INSERT INTO groups (
-                name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, sort_order
+                name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+                sort_order, parent_id, level
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
-            (name, description, color, proxy_url or '', fallback_proxy_url_1 or '', fallback_proxy_url_2 or '', 999999)
+            (
+                name, description, color, proxy_url or '', fallback_proxy_url_1 or '',
+                fallback_proxy_url_2 or '', 999999, normalized_parent_id, level
+            )
         )
         group_id = cursor.lastrowid
-        set_group_position(group_id, sort_position, db)
+        set_group_position(group_id, sort_position, db, normalized_parent_id)
         db.commit()
         return group_id
     except sqlite3.IntegrityError:
@@ -133,16 +335,34 @@ def add_group(name: str, description: str = '', color: str = '#1a1a1a',
 
 def update_group(group_id: int, name: str, description: str, color: str,
                  proxy_url: str = '', fallback_proxy_url_1: str = '',
-                 fallback_proxy_url_2: str = '', sort_position: Optional[int] = None) -> bool:
+                 fallback_proxy_url_2: str = '', sort_position: Optional[int] = None,
+                 parent_id: Any = _UNSET_PARENT) -> bool:
     """更新分组"""
     db = get_db()
     try:
+        current = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+        if not current:
+            return False
+        current_dict = dict(current)
+        target_parent_id = current_dict.get('parent_id') if parent_id is _UNSET_PARENT else normalize_group_parent_id(parent_id)
+        target_level = int(current_dict.get('level') or 1)
+        if parent_id is not _UNSET_PARENT and target_parent_id != current_dict.get('parent_id'):
+            valid_move, _ = validate_group_move(group_id, target_parent_id, db)
+            if not valid_move:
+                return False
+            _, _, target_level = validate_group_parent_for_create(target_parent_id, db)
+
         db.execute('''
             UPDATE groups
-            SET name = ?, description = ?, color = ?, proxy_url = ?, fallback_proxy_url_1 = ?, fallback_proxy_url_2 = ?
+            SET name = ?, description = ?, color = ?, proxy_url = ?, fallback_proxy_url_1 = ?,
+                fallback_proxy_url_2 = ?, parent_id = ?, level = ?
             WHERE id = ?
-        ''', (name, description, color, proxy_url or '', fallback_proxy_url_1 or '', fallback_proxy_url_2 or '', group_id))
-        if not set_group_position(group_id, sort_position, db):
+        ''', (
+            name, description, color, proxy_url or '', fallback_proxy_url_1 or '',
+            fallback_proxy_url_2 or '', target_parent_id, target_level, group_id
+        ))
+        rebuild_group_levels(group_id, db)
+        if not set_group_position(group_id, sort_position, db, target_parent_id):
             return False
         db.commit()
         return True
@@ -152,38 +372,66 @@ def update_group(group_id: int, name: str, description: str, color: str,
 
 def delete_group(group_id: int) -> bool:
     """删除分组（将该分组下的邮箱移到默认分组）"""
+    return delete_group_tree(group_id).get('success', False)
+
+
+def delete_group_tree(group_id: int) -> Dict[str, Any]:
+    """级联删除分组及后代，并将相关账号移回默认分组。"""
     db = get_db()
     try:
-        # 将该分组下的邮箱移到默认分组（id=1）
-        db.execute('UPDATE accounts SET group_id = 1 WHERE group_id = ?', (group_id,))
-        # 删除分组（不能删除默认分组）
-        if group_id != 1:
-            db.execute('DELETE FROM groups WHERE id = ?', (group_id,))
+        group = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+        if not group:
+            return {'success': False, 'error': '分组不存在', 'deleted_child_count': 0}
+        group_dict = dict(group)
+        if group_id == DEFAULT_GROUP_ID:
+            return {'success': False, 'error': '默认分组不能删除', 'deleted_child_count': 0}
+        if is_temp_group_row(group_dict):
+            return {'success': False, 'error': '临时邮箱分组不能删除', 'deleted_child_count': 0}
+
+        descendant_ids = get_descendant_group_ids(group_id, db)
+        if not descendant_ids:
+            return {'success': False, 'error': '分组不存在', 'deleted_child_count': 0}
+        if DEFAULT_GROUP_ID in descendant_ids:
+            return {'success': False, 'error': '默认分组不能删除', 'deleted_child_count': 0}
+
+        placeholders = ','.join('?' * len(descendant_ids))
+        db.execute(f'UPDATE accounts SET group_id = ? WHERE group_id IN ({placeholders})', [DEFAULT_GROUP_ID] + descendant_ids)
+        delete_rows = db.execute(
+            f'SELECT id FROM groups WHERE id IN ({placeholders}) ORDER BY level DESC, id DESC',
+            descendant_ids
+        ).fetchall()
+        for row in delete_rows:
+            db.execute('DELETE FROM groups WHERE id = ?', (row['id'],))
         normalize_group_order(db)
         db.commit()
-        return True
-    except Exception:
-        return False
+        return {'success': True, 'deleted_child_count': max(0, len(descendant_ids) - 1)}
+    except Exception as exc:
+        return {'success': False, 'error': str(exc), 'deleted_child_count': 0}
 
 
-def get_group_account_count(group_id: int) -> int:
-    """获取分组下的邮箱数量"""
+def get_group_account_count(group_id: int, recursive: bool = False) -> int:
+    """获取分组下的邮箱数量；recursive=True 时包含所有后代分组。"""
     db = get_db()
-    cursor = db.execute('SELECT COUNT(*) as count FROM accounts WHERE group_id = ?', (group_id,))
+    group_ids = get_descendant_group_ids(group_id, db) if recursive else [group_id]
+    if not group_ids:
+        return 0
+    placeholders = ','.join('?' * len(group_ids))
+    cursor = db.execute(f'SELECT COUNT(*) as count FROM accounts WHERE group_id IN ({placeholders})', group_ids)
     row = cursor.fetchone()
     return row['count'] if row else 0
 
 
-def reorder_groups(group_ids: List[int]) -> bool:
-    """重新排序分组，临时邮箱分组固定在最前面"""
+def reorder_groups(group_ids: List[int], parent_id: Optional[int] = None) -> bool:
+    """重新排序同一父级下的分组，临时邮箱分组固定在根列表最前面。"""
     db = get_db()
     try:
-        movable_ids = get_movable_group_ids(db)
+        normalized_parent_id = normalize_group_parent_id(parent_id)
+        movable_ids = get_movable_group_ids(db, parent_id=normalized_parent_id)
 
         if set(group_ids) != set(movable_ids):
             return False
 
-        apply_group_order(group_ids, db)
+        apply_group_order(group_ids, db, normalized_parent_id)
         db.commit()
         return True
     except Exception:
@@ -310,11 +558,21 @@ def normalize_account_search_terms(query: Any) -> List[str]:
 
 
 def build_account_where_clause(group_id: int = None, query: str = '',
-                               tag_ids: Any = None, include_untagged: bool = False) -> tuple[str, List[Any]]:
+                               tag_ids: Any = None, include_untagged: bool = False,
+                               include_descendants: bool = True) -> tuple[str, List[Any]]:
     clauses = []
     params: List[Any] = []
 
-    if group_id:
+    if group_id and include_descendants:
+        group_ids = get_descendant_group_ids(group_id)
+        if group_ids:
+            placeholders = ','.join('?' * len(group_ids))
+            clauses.append(f'a.group_id IN ({placeholders})')
+            params.extend(group_ids)
+        else:
+            clauses.append('a.group_id = ?')
+            params.append(group_id)
+    elif group_id:
         clauses.append('a.group_id = ?')
         params.append(group_id)
 
@@ -404,11 +662,17 @@ def serialize_account_rows(rows: List[sqlite3.Row], db=None) -> List[Dict]:
 
 def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
                   sort_by: Any = 'created_at', sort_order: Any = 'desc',
-                  tag_ids: Any = None, include_untagged: bool = False) -> List[Dict]:
+                  tag_ids: Any = None, include_untagged: bool = False,
+                  include_descendants: bool = True) -> List[Dict]:
     """从数据库加载邮箱账号"""
     db = get_db()
     normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
-    where_clause, params = build_account_where_clause(group_id, tag_ids=tag_ids, include_untagged=include_untagged)
+    where_clause, params = build_account_where_clause(
+        group_id,
+        tag_ids=tag_ids,
+        include_untagged=include_untagged,
+        include_descendants=include_descendants,
+    )
     order_clause = build_account_order_clause(sort_by, sort_order)
     pagination_clause = ''
     if normalized_limit is not None:
@@ -428,7 +692,8 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
 
 
 def count_accounts(group_id: int = None, query: str = '',
-                   tag_ids: Any = None, include_untagged: bool = False) -> int:
+                   tag_ids: Any = None, include_untagged: bool = False,
+                   include_descendants: bool = True) -> int:
     db = get_db()
     normalized_query = str(query or '').strip()
     joins = '''
@@ -440,7 +705,13 @@ def count_accounts(group_id: int = None, query: str = '',
             LEFT JOIN account_tags at ON a.id = at.account_id
             LEFT JOIN tags t ON at.tag_id = t.id
         '''
-    where_clause, params = build_account_where_clause(group_id, normalized_query, tag_ids, include_untagged)
+    where_clause, params = build_account_where_clause(
+        group_id,
+        normalized_query,
+        tag_ids,
+        include_untagged,
+        include_descendants,
+    )
     count_expr = 'COUNT(DISTINCT a.id)' if normalized_query else 'COUNT(*)'
     row = db.execute(f'''
         SELECT {count_expr} AS count
@@ -454,14 +725,15 @@ def count_accounts(group_id: int = None, query: str = '',
 def search_account_records(query: str, limit: Any = None, offset: Any = 0,
                            sort_by: Any = 'created_at', sort_order: Any = 'desc',
                            tag_ids: Any = None, include_untagged: bool = False,
-                           group_id: int = None) -> List[Dict]:
+                           group_id: int = None, include_descendants: bool = True) -> List[Dict]:
     db = get_db()
     normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
     where_clause, params = build_account_where_clause(
         group_id=group_id,
         query=query,
         tag_ids=tag_ids,
-        include_untagged=include_untagged
+        include_untagged=include_untagged,
+        include_descendants=include_descendants,
     )
     order_clause = build_account_order_clause(sort_by, sort_order)
     pagination_clause = ''
@@ -818,8 +1090,41 @@ def resolve_account_for_email_api(email_addr: str) -> Optional[Dict]:
     return None
 
 
-def get_account_proxy_url(account: Optional[Dict[str, Any]]) -> str:
-    proxy_config = get_account_proxy_config(account)
+PROXY_MAIL_PLACEHOLDER = '{mail}'
+
+
+def build_proxy_mail_placeholder_value(email: Any) -> str:
+    """从邮箱生成 {mail} 替换值：local-part 仅保留字母数字并小写。"""
+    raw = str(email or '').strip()
+    if not raw:
+        return ''
+    local_part = raw.split('@', 1)[0]
+    return re.sub(r'[^A-Za-z0-9]', '', local_part).lower()
+
+
+def expand_proxy_url_template(url: Any, email: Any = None) -> str:
+    """运行时展开代理 URL 中的 {mail}；无占位符或无邮箱时原样透传。"""
+    value = str(url or '').strip()
+    if not value or PROXY_MAIL_PLACEHOLDER not in value:
+        return value
+    email_str = str(email or '').strip()
+    if not email_str:
+        return value
+    return value.replace(PROXY_MAIL_PLACEHOLDER, build_proxy_mail_placeholder_value(email_str))
+
+
+def expand_proxy_config(proxy_config: Optional[Dict[str, str]], email: Any = None) -> Dict[str, str]:
+    config = proxy_config or get_empty_proxy_config()
+    return {
+        'proxy_url': expand_proxy_url_template(config.get('proxy_url', ''), email),
+        'fallback_proxy_url_1': expand_proxy_url_template(config.get('fallback_proxy_url_1', ''), email),
+        'fallback_proxy_url_2': expand_proxy_url_template(config.get('fallback_proxy_url_2', ''), email),
+    }
+
+
+def get_account_proxy_url(account: Optional[Dict[str, Any]], db=None) -> str:
+    """出站用主代理（含分组继承与 {mail} 展开）。"""
+    proxy_config = get_account_resolved_proxy_config(account, db=db)
     return proxy_config.get('proxy_url', '') or ''
 
 
@@ -846,23 +1151,82 @@ def account_has_proxy_override(account: Optional[Dict[str, Any]]) -> bool:
     return any(account_proxy_config.values())
 
 
-def get_account_proxy_config(account: Optional[Dict[str, Any]]) -> Dict[str, str]:
+def get_account_proxy_config(account: Optional[Dict[str, Any]], db=None) -> Dict[str, str]:
+    """存储/编辑用代理配置（不展开 {mail}）。"""
     if account_has_proxy_override(account):
         return get_account_override_proxy_config(account)
     if not account or not account.get('group_id'):
         return get_empty_proxy_config()
-    group = get_group_by_id(account['group_id'])
+    group = get_group_by_id(account['group_id'], db=db)
     if not group:
         return get_empty_proxy_config()
+    return get_group_inherited_proxy_config(group, db=db)
+
+
+def get_account_resolved_proxy_config(account: Optional[Dict[str, Any]], db=None) -> Dict[str, str]:
+    """出站网络用代理：继承解析后再展开 {mail}。"""
+    email = account.get('email') if account else None
+    return expand_proxy_config(get_account_proxy_config(account, db=db), email)
+
+
+def get_upload_account_resolved_proxy_config(upload_row: Any, db=None) -> Dict[str, str]:
+    """上传账号自动授权用代理：自身 proxy_url 优先，否则分组继承，再展开 {mail}。"""
+    if not upload_row:
+        return get_empty_proxy_config()
+    row = dict(upload_row) if hasattr(upload_row, 'keys') else dict(upload_row or {})
+    email = row.get('email')
+    own_proxy = str(row.get('proxy_url') or '').strip()
+    if own_proxy:
+        return expand_proxy_config(
+            {
+                'proxy_url': own_proxy,
+                'fallback_proxy_url_1': '',
+                'fallback_proxy_url_2': '',
+            },
+            email,
+        )
+    group_id = row.get('group_id')
+    if group_id:
+        group = get_group_by_id(group_id, db=db)
+        if group:
+            return expand_proxy_config(get_group_inherited_proxy_config(group, db=db), email)
+    return get_empty_proxy_config()
+
+
+def get_group_inherited_proxy_config(group_row: Optional[Dict[str, Any]], db=None) -> Dict[str, str]:
+    current_group = group_row
+    visited_group_ids = set()
+    while current_group:
+        current_group_id = current_group.get('id')
+        if current_group_id in visited_group_ids:
+            break
+        visited_group_ids.add(current_group_id)
+        if group_has_proxy_config(current_group):
+            return {
+                'proxy_url': current_group.get('proxy_url', '') or '',
+                'fallback_proxy_url_1': current_group.get('fallback_proxy_url_1', '') or '',
+                'fallback_proxy_url_2': current_group.get('fallback_proxy_url_2', '') or '',
+            }
+        parent_id = current_group.get('parent_id')
+        if not parent_id:
+            break
+        current_group = get_group_by_id(parent_id, db=db)
+    return get_empty_proxy_config()
+
+
+def get_group_direct_proxy_config(group_row: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not group_row:
+        return get_empty_proxy_config()
     return {
-        'proxy_url': group.get('proxy_url', '') or '',
-        'fallback_proxy_url_1': group.get('fallback_proxy_url_1', '') or '',
-        'fallback_proxy_url_2': group.get('fallback_proxy_url_2', '') or '',
+        'proxy_url': group_row.get('proxy_url', '') or '',
+        'fallback_proxy_url_1': group_row.get('fallback_proxy_url_1', '') or '',
+        'fallback_proxy_url_2': group_row.get('fallback_proxy_url_2', '') or '',
     }
 
 
-def get_account_proxy_failover_urls(account: Optional[Dict[str, Any]]) -> List[str]:
-    proxy_config = get_account_proxy_config(account)
+def get_account_proxy_failover_urls(account: Optional[Dict[str, Any]], db=None) -> List[str]:
+    """出站用回退代理列表（含 {mail} 展开）。"""
+    proxy_config = get_account_resolved_proxy_config(account, db=db)
     return [
         proxy_config.get('fallback_proxy_url_1', '') or '',
         proxy_config.get('fallback_proxy_url_2', '') or '',
@@ -1130,6 +1494,497 @@ def add_accounts_bulk(parsed_accounts: List[Dict[str, Any]], group_id: int = 1,
     }
 
 
+def normalize_upload_email(email: str) -> str:
+    return (email or '').strip().lower()
+
+
+def get_account_tags_by_email_map(emails: List[str], db=None) -> Dict[str, List[Dict]]:
+    normalized_emails: List[str] = []
+    seen = set()
+    for email in emails:
+        normalized = normalize_upload_email(email)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_emails.append(normalized)
+
+    if not normalized_emails:
+        return {}
+
+    database = db or get_db()
+    tags_by_email: Dict[str, List[Dict]] = {email: [] for email in normalized_emails}
+    for start in range(0, len(normalized_emails), 200):
+        chunk = normalized_emails[start:start + 200]
+        placeholders = ','.join('?' * len(chunk))
+        rows = database.execute(f'''
+            SELECT LOWER(a.email) AS account_email, t.*
+            FROM accounts a
+            JOIN account_tags at ON a.id = at.account_id
+            JOIN tags t ON at.tag_id = t.id
+            WHERE LOWER(a.email) IN ({placeholders})
+            ORDER BY LOWER(a.email), t.created_at DESC
+        ''', tuple(chunk)).fetchall()
+
+        for row in rows:
+            tag = dict(row)
+            account_email = normalize_upload_email(tag.pop('account_email', ''))
+            tags_by_email.setdefault(account_email, []).append(tag)
+    return tags_by_email
+
+
+def encode_upload_tag_ids(tag_ids: Any = None) -> str:
+    """将标签 ID 列表编码为 upload 表存储字符串。"""
+    return ','.join(str(tag_id) for tag_id in normalize_tag_ids_input(tag_ids))
+
+
+def decode_upload_tag_ids(raw: Any = None) -> List[int]:
+    """解析 upload 表中的标签 ID 字符串。"""
+    return normalize_tag_ids_input(raw)
+
+
+def resolve_upload_group_id(group_id: Any = None) -> int:
+    """解析上传账号目标分组；无效时回退默认分组。"""
+    try:
+        resolved = int(group_id)
+    except (TypeError, ValueError):
+        resolved = DEFAULT_GROUP_ID
+    if resolved <= 0:
+        return DEFAULT_GROUP_ID
+    db = get_db()
+    exists = db.execute('SELECT id FROM groups WHERE id = ?', (resolved,)).fetchone()
+    return int(exists['id']) if exists else DEFAULT_GROUP_ID
+
+
+def add_upload_account(email: str, password: str, remark: str = '',
+                       group_id: Any = None, proxy_url: str = '',
+                       tag_ids: Any = None) -> Dict[str, Any]:
+    """插入一条外部上传的 Outlook 账号到 outlook_upload_accounts。
+
+    密码加密存储。不在本函数内 commit，由调用方统一提交。
+    返回 {'email', 'status': 'added'|'duplicate'|'invalid', 'id'?}
+    """
+    normalized_email = normalize_upload_email(email)
+    raw_password = password if password is not None else ''
+    if '@' not in normalized_email or not raw_password:
+        return {'email': normalized_email or (email or ''), 'status': 'invalid'}
+
+    resolved_group_id = resolve_upload_group_id(group_id)
+    encoded_tag_ids = encode_upload_tag_ids(tag_ids)
+    normalized_proxy = str(proxy_url or '').strip()
+
+    db = get_db()
+    cursor = db.execute(
+        '''
+        INSERT OR IGNORE INTO outlook_upload_accounts
+            (email, password, remark, source, group_id, proxy_url, tag_ids)
+        VALUES (?, ?, ?, 'external_api', ?, ?, ?)
+        ''',
+        (
+            normalized_email,
+            encrypt_data(raw_password),
+            remark or '',
+            resolved_group_id,
+            normalized_proxy,
+            encoded_tag_ids,
+        ),
+    )
+    if cursor.rowcount == 1:
+        return {
+            'email': normalized_email,
+            'status': 'added',
+            'id': cursor.lastrowid,
+            'group_id': resolved_group_id,
+            'proxy_url': normalized_proxy,
+            'tag_ids': decode_upload_tag_ids(encoded_tag_ids),
+        }
+    return {'email': normalized_email, 'status': 'duplicate'}
+
+
+def upsert_upload_account_for_auto_auth(email: str, password: str,
+                                        remark: str = '',
+                                        group_id: Any = None,
+                                        proxy_url: str = '',
+                                        tag_ids: Any = None) -> Dict[str, Any]:
+    """显式重新入队 helper：供内部"加入自动授权"路径调用。
+
+    - 邮箱不存在时新增记录（source = 'auto_auth'）。
+    - 邮箱已存在时覆盖加密密码、备注、来源、目标分组/代理/标签，并重置 is_authorized = 0、status = 'active'。
+    - 不改变 ``add_upload_account()`` 的默认 duplicate 行为。
+    - 不在本函数内 commit，由调用方统一提交。
+    - 返回 ``{'email', 'status': 'added'|'updated', 'id'}``。
+    """
+    normalized_email = normalize_upload_email(email)
+    raw_password = password if password is not None else ''
+    if '@' not in normalized_email or not raw_password:
+        return {'email': normalized_email or (email or ''), 'status': 'invalid'}
+
+    resolved_group_id = resolve_upload_group_id(group_id)
+    encoded_tag_ids = encode_upload_tag_ids(tag_ids)
+    normalized_proxy = str(proxy_url or '').strip()
+
+    db = get_db()
+    encrypted_password = encrypt_data(raw_password)
+    existing = db.execute(
+        'SELECT id FROM outlook_upload_accounts WHERE email = ? LIMIT 1',
+        (normalized_email,),
+    ).fetchone()
+
+    if existing:
+        upload_id = int(existing['id'])
+        db.execute(
+            '''
+            UPDATE outlook_upload_accounts
+            SET password = ?,
+                remark = ?,
+                source = 'auto_auth',
+                is_authorized = 0,
+                status = 'active',
+                group_id = ?,
+                proxy_url = ?,
+                tag_ids = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            ''',
+            (
+                encrypted_password,
+                remark or '',
+                resolved_group_id,
+                normalized_proxy,
+                encoded_tag_ids,
+                upload_id,
+            ),
+        )
+        return {
+            'email': normalized_email,
+            'status': 'updated',
+            'id': upload_id,
+            'group_id': resolved_group_id,
+            'proxy_url': normalized_proxy,
+            'tag_ids': decode_upload_tag_ids(encoded_tag_ids),
+        }
+
+    cursor = db.execute(
+        '''
+        INSERT INTO outlook_upload_accounts
+            (email, password, remark, source, is_authorized, status, group_id, proxy_url, tag_ids)
+        VALUES (?, ?, ?, 'auto_auth', 0, 'active', ?, ?, ?)
+        ''',
+        (
+            normalized_email,
+            encrypted_password,
+            remark or '',
+            resolved_group_id,
+            normalized_proxy,
+            encoded_tag_ids,
+        ),
+    )
+    return {
+        'email': normalized_email,
+        'status': 'added',
+        'id': int(cursor.lastrowid),
+        'group_id': resolved_group_id,
+        'proxy_url': normalized_proxy,
+        'tag_ids': decode_upload_tag_ids(encoded_tag_ids),
+    }
+
+
+def get_upload_account_plain_password(row: Any, *, tolerate_decrypt_error: bool = False) -> str:
+    data = dict(row) if hasattr(row, 'keys') else {'password': row}
+    try:
+        return decrypt_data(str(data.get('password') or ''))
+    except RuntimeError:
+        if tolerate_decrypt_error:
+            return ''
+        raise
+
+
+def get_upload_account_proxy_display(proxy_url: Any) -> str:
+    """返回不含认证信息、路径和查询参数的账号代理地址。"""
+    normalized_proxy = str(proxy_url or '').strip()
+    if not normalized_proxy:
+        return ''
+    parsed_proxy = urlparse(normalized_proxy)
+    if not parsed_proxy.scheme or not parsed_proxy.hostname:
+        return '已配置代理'
+    host = parsed_proxy.hostname
+    if ':' in host and not host.startswith('['):
+        host = f'[{host}]'
+    try:
+        port = parsed_proxy.port
+    except ValueError:
+        return '已配置代理'
+    if port is not None:
+        host = f'{host}:{port}'
+    return f'{parsed_proxy.scheme}://{host}'
+
+
+def serialize_upload_account_row(row: Any, tags: Optional[List[Dict]] = None) -> Dict[str, Any]:
+    """将 outlook_upload_accounts 行转为前端展示用字典。"""
+    data = dict(row)
+    plain_password = get_upload_account_plain_password(
+        data.get('password') or '',
+        tolerate_decrypt_error=True,
+    )
+    tag_ids = decode_upload_tag_ids(data.get('tag_ids'))
+    return {
+        'id': data.get('id'),
+        'email': data.get('email') or '',
+        'password': plain_password,
+        'has_password': bool(plain_password),
+        'password_length': len(plain_password),
+        'is_authorized': bool(data.get('is_authorized')),
+        'status': data.get('status') or '',
+        'remark': data.get('remark') or '',
+        'source': data.get('source') or '',
+        'group_id': int(data.get('group_id') or DEFAULT_GROUP_ID),
+        'proxy_url': get_upload_account_proxy_display(data.get('proxy_url')),
+        'tag_ids': tag_ids,
+        'created_at': data.get('created_at'),
+        'updated_at': data.get('updated_at'),
+        'tags': tags or [],
+    }
+
+
+def delete_upload_account(account_id: int) -> bool:
+    """删除指定 ID 的外部上传账号。
+
+    返回 True 表示删除成功，False 表示账号不存在。
+    不在本函数内 commit，由调用方统一提交。
+    """
+    db = get_db()
+    cursor = db.execute(
+        'DELETE FROM outlook_upload_accounts WHERE id = ?',
+        (account_id,)
+    )
+    return cursor.rowcount > 0
+
+
+def delete_upload_accounts_bulk(account_ids: List[int]) -> Dict[str, Any]:
+    """批量删除上传账号。返回 deleted/not_found 计数与结果列表。"""
+    normalized_ids = normalize_account_ids(account_ids)
+    deleted = 0
+    not_found = 0
+    results: List[Dict[str, Any]] = []
+    for account_id in normalized_ids:
+        ok = delete_upload_account(account_id)
+        if ok:
+            deleted += 1
+            results.append({'id': account_id, 'status': 'deleted'})
+        else:
+            not_found += 1
+            results.append({'id': account_id, 'status': 'not_found'})
+    return {
+        'total': len(normalized_ids),
+        'deleted': deleted,
+        'not_found': not_found,
+        'results': results,
+    }
+
+
+def update_upload_account(account_id: int, *, email: Optional[str] = None,
+                          password: Optional[str] = None,
+                          remark: Optional[str] = None) -> Dict[str, Any]:
+    """更新指定 ID 的外部上传账号。
+
+    - email: 传入非空字符串才会修改；会规范化并校验包含 '@'。
+    - password: 仅当为非空字符串时才会更新密码（加密存储）；None 或空字符串视为保持原密码。
+    - remark: 仅当不为 None 时才会更新备注（允许空字符串清空）。
+    修改 email/password 时同步刷新 updated_at。不在本函数内 commit。
+
+    返回 {'status': 'updated'|'not_found'|'duplicate'|'invalid', 'id', 'email'?}
+    """
+    db = get_db()
+    row = db.execute(
+        'SELECT id, email FROM outlook_upload_accounts WHERE id = ?',
+        (account_id,),
+    ).fetchone()
+    if not row:
+        return {'status': 'not_found', 'id': account_id}
+
+    updates: List[str] = []
+    params: List[Any] = []
+    new_email: Optional[str] = None
+    reset_authorized = False
+
+    if email is not None and email.strip() != '':
+        new_email = normalize_upload_email(email)
+        if '@' not in new_email:
+            return {'status': 'invalid', 'id': account_id, 'email': new_email}
+        if new_email != row['email']:
+            dup = db.execute(
+                'SELECT id FROM outlook_upload_accounts WHERE email = ? AND id != ?',
+                (new_email, account_id),
+            ).fetchone()
+            if dup:
+                return {'status': 'duplicate', 'id': account_id, 'email': new_email}
+            updates.append('email = ?')
+            params.append(new_email)
+            reset_authorized = True
+
+    if password is not None and password != '':
+        updates.append('password = ?')
+        params.append(encrypt_data(password))
+        reset_authorized = True
+
+    if remark is not None:
+        updates.append('remark = ?')
+        params.append(remark)
+
+    if not updates:
+        return {'status': 'updated', 'id': account_id, 'email': row['email']}
+
+    if reset_authorized:
+        updates.append('is_authorized = 0')
+
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    params.append(account_id)
+    db.execute(
+        f"UPDATE outlook_upload_accounts SET {', '.join(updates)} WHERE id = ?",
+        tuple(params),
+    )
+    return {'status': 'updated', 'id': account_id, 'email': new_email or row['email']}
+
+
+UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE = 20
+UPLOAD_ACCOUNTS_MAX_PAGE_SIZE = 1000
+
+
+def query_upload_accounts_page(page: int = 1,
+                               page_size: int = UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE,
+                               keyword: str = '', auth_status: str = 'all') -> Dict[str, Any]:
+    """分页查询外部上传的 Outlook 账号。
+
+    返回 {'items', 'total', 'page', 'page_size', 'total_pages'}。
+    keyword 命中 email/remark（模糊匹配）；auth_status 支持
+    all/authorized/unauthorized。
+    """
+    try:
+        safe_page = int(1 if page in (None, '') else page)
+    except (TypeError, ValueError):
+        safe_page = 1
+    safe_page = max(1, safe_page)
+
+    try:
+        safe_page_size = int(
+            UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE
+            if page_size in (None, '') else page_size
+        )
+    except (TypeError, ValueError):
+        safe_page_size = UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE
+    safe_page_size = min(max(1, safe_page_size), UPLOAD_ACCOUNTS_MAX_PAGE_SIZE)
+
+    normalized_keyword = (keyword or '').strip()
+    normalized_auth_status = str(auth_status or 'all').strip().lower()
+    if normalized_auth_status not in {'authorized', 'unauthorized'}:
+        normalized_auth_status = 'all'
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if normalized_keyword:
+        clauses.append('(email LIKE ? OR remark LIKE ?)')
+        like = f'%{normalized_keyword}%'
+        params.extend([like, like])
+    if normalized_auth_status == 'authorized':
+        clauses.append('is_authorized = 1')
+    elif normalized_auth_status == 'unauthorized':
+        clauses.append('COALESCE(is_authorized, 0) = 0')
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+
+    db = get_db()
+    total = db.execute(
+        f'SELECT COUNT(*) AS cnt FROM outlook_upload_accounts {where_sql}',
+        tuple(params),
+    ).fetchone()['cnt']
+    total = int(total or 0)
+
+    total_pages = max(1, (total + safe_page_size - 1) // safe_page_size)
+    if safe_page > total_pages:
+        safe_page = total_pages
+    offset = (safe_page - 1) * safe_page_size
+
+    rows = db.execute(
+        f'''
+        SELECT id, email, password, is_authorized, status, remark, source,
+               group_id, proxy_url, tag_ids, created_at, updated_at
+        FROM outlook_upload_accounts
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        ''',
+        tuple(params) + (safe_page_size, offset),
+    ).fetchall()
+
+    tags_by_email = get_account_tags_by_email_map([row['email'] for row in rows], db)
+
+    return {
+        'items': [
+            serialize_upload_account_row(
+                row,
+                tags_by_email.get(normalize_upload_email(row['email']), []),
+            )
+            for row in rows
+        ],
+        'total': total,
+        'page': safe_page,
+        'page_size': safe_page_size,
+        'total_pages': total_pages,
+    }
+
+
+def add_upload_accounts_bulk(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """单事务批量插入外部上传账号。items: [{'email','password','remark'?, ...}, ...]"""
+    results: List[Dict[str, Any]] = []
+    added = duplicate = invalid = 0
+    db = get_db()
+    for item in items:
+        outcome = add_upload_account(
+            item.get('email', ''),
+            item.get('password', ''),
+            item.get('remark', ''),
+            group_id=item.get('group_id'),
+            proxy_url=item.get('proxy_url', ''),
+            tag_ids=item.get('tag_ids'),
+        )
+        if outcome['status'] == 'added':
+            added += 1
+        elif outcome['status'] == 'duplicate':
+            duplicate += 1
+        else:
+            invalid += 1
+        results.append(outcome)
+    db.commit()
+    return {
+        'total': len(items),
+        'added': added,
+        'duplicate': duplicate,
+        'invalid': invalid,
+        'results': results,
+    }
+
+
+def apply_account_tag_ids(account_id: int, tag_ids: Any = None, db=None) -> int:
+    """给正式账号附加标签（忽略不存在的标签 ID）。返回成功写入条数。"""
+    database = db or get_db()
+    normalized_tag_ids = normalize_tag_ids_input(tag_ids)
+    if not normalized_tag_ids:
+        return 0
+    placeholders = ','.join('?' * len(normalized_tag_ids))
+    existing_rows = database.execute(
+        f'SELECT id FROM tags WHERE id IN ({placeholders})',
+        normalized_tag_ids,
+    ).fetchall()
+    valid_ids = [int(row['id']) for row in existing_rows]
+    written = 0
+    for tag_id in valid_ids:
+        cursor = database.execute(
+            'INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)',
+            (account_id, tag_id),
+        )
+        written += int(cursor.rowcount or 0)
+    return written
+
+
 def update_account(account_id: int, email_addr: str, password: str, client_id: str,
                    refresh_token: str, group_id: int, sort_order: Optional[int], remark: str, status: str,
                    account_type: str = 'outlook', provider: str = 'outlook',
@@ -1207,6 +2062,19 @@ def normalize_project_key(project_key: str) -> str:
 
 def normalize_project_group_ids(group_ids: Optional[List[int]]) -> List[int]:
     return normalize_account_ids(group_ids or [])
+
+
+def expand_group_ids_with_descendants(group_ids: List[int], db=None) -> List[int]:
+    database = db or get_db()
+    expanded_group_ids: List[int] = []
+    seen_group_ids = set()
+    for group_id in normalize_account_ids(group_ids):
+        for descendant_id in get_descendant_group_ids(group_id, database):
+            if descendant_id in seen_group_ids:
+                continue
+            seen_group_ids.add(descendant_id)
+            expanded_group_ids.append(descendant_id)
+    return expanded_group_ids
 
 
 def parse_bool_flag(value: Any, default: bool = False) -> bool:
@@ -1363,23 +2231,27 @@ def get_project_scope_accounts(project_id: int, db=None) -> List[sqlite3.Row]:
         return []
 
     if project_row['scope_mode'] == 'groups':
+        scope_group_ids = expand_group_ids_with_descendants(load_project_group_ids(project_id, database), database)
+        if not scope_group_ids:
+            account_rows = []
+        else:
+            placeholders = ','.join('?' * len(scope_group_ids))
+            account_rows = database.execute(
+                f'''
+                SELECT DISTINCT a.id, a.email, a.group_id
+                FROM accounts a
+                WHERE a.group_id IN ({placeholders})
+                ORDER BY a.id ASC
+                ''',
+                scope_group_ids
+            ).fetchall()
+    else:
         account_rows = database.execute(
             '''
             SELECT DISTINCT a.id, a.email, a.group_id
             FROM accounts a
-            JOIN project_group_scopes pgs ON pgs.group_id = a.group_id
-            WHERE pgs.project_id = ?
             ORDER BY a.id ASC
             ''',
-            (project_id,)
-        ).fetchall()
-    else:
-        account_rows = database.execute(
-            '''
-            SELECT a.id, a.email, a.group_id
-            FROM accounts a
-            ORDER BY a.id ASC
-            '''
         ).fetchall()
 
     if not parse_bool_flag(project_row['use_alias_email'], False):
@@ -2159,8 +3031,14 @@ def load_project_accounts(project_key: str, status: str = '', group_id: Optional
         sql += ' AND pa.status = ?'
         params.append(status)
     if group_id is not None:
-        sql += ' AND COALESCE(a.group_id, pa.source_group_id) = ?'
-        params.append(group_id)
+        descendant_group_ids = get_descendant_group_ids(group_id, db)
+        if descendant_group_ids:
+            placeholders = ','.join('?' * len(descendant_group_ids))
+            sql += f' AND COALESCE(a.group_id, pa.source_group_id) IN ({placeholders})'
+            params.extend(descendant_group_ids)
+        else:
+            sql += ' AND COALESCE(a.group_id, pa.source_group_id) = ?'
+            params.append(group_id)
     if provider:
         sql += ' AND COALESCE(a.provider, \'\') = ?'
         params.append(provider)

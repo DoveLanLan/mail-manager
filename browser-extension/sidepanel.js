@@ -64,6 +64,69 @@
       .replaceAll("'", '&#39;');
   }
 
+  function normalizeGroupLevel(group) {
+    const level = Number(group?.level || 1);
+    return Math.max(1, Math.min(3, Number.isFinite(level) ? level : 1));
+  }
+
+  function normalizeGroupParentId(value) {
+    const parentId = Number(value);
+    return Number.isFinite(parentId) && parentId > 0 ? parentId : null;
+  }
+
+  function isSystemGroup(group) {
+    return !!(group && (group.is_system === 1 || group.name === '临时邮箱'));
+  }
+
+  function sortGroupsForTree(left, right) {
+    if (left.name === '临时邮箱' && right.name !== '临时邮箱') return -1;
+    if (right.name === '临时邮箱' && left.name !== '临时邮箱') return 1;
+    const leftOrder = Number(left.sort_order || 0);
+    const rightOrder = Number(right.sort_order || 0);
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+    return Number(left.id) - Number(right.id);
+  }
+
+  function buildGroupTree(flatGroups) {
+    const nodeMap = new Map();
+    (flatGroups || []).forEach(group => {
+      nodeMap.set(Number(group.id), { ...group, children: [] });
+    });
+
+    const roots = [];
+    nodeMap.forEach(node => {
+      const parentId = normalizeGroupParentId(node.parent_id);
+      const parent = parentId ? nodeMap.get(parentId) : null;
+      if (parent) {
+        parent.children.push(node);
+      } else {
+        roots.push(node);
+      }
+    });
+
+    function sortNodeChildren(nodes) {
+      nodes.sort(sortGroupsForTree);
+      nodes.forEach(node => sortNodeChildren(node.children));
+    }
+
+    sortNodeChildren(roots);
+    return roots;
+  }
+
+  function flattenGroupTree(nodes) {
+    const result = [];
+    function visit(nodeList) {
+      nodeList.forEach(node => {
+        result.push(node);
+        if (node.children?.length) {
+          visit(node.children);
+        }
+      });
+    }
+    visit(nodes || []);
+    return result;
+  }
+
   function valueOf(id) {
     return (getEl(id)?.value ?? '').trim();
   }
@@ -254,12 +317,57 @@
   }
 
   function groupOptions(groups, selectedId, includeTemp = true) {
-    return (groups || [])
+    const isSystem = (g) => !!(g && (g.is_system === 1 || g.name === '临时邮箱'));
+    const isLastChild = (g) => {
+      const pid = g.parent_id ? Number(g.parent_id) : null;
+      const siblings = (groups || [])
+        .filter((item) => !isSystem(item) && Number(item.id) !== 1 && (item.parent_id ? Number(item.parent_id) : null) === pid)
+        .sort((left, right) => {
+          const lo = Number(left.sort_order || 0);
+          const ro = Number(right.sort_order || 0);
+          return lo !== ro ? lo - ro : Number(left.id) - Number(right.id);
+        });
+      if (!siblings.length) return true;
+      return Number(siblings[siblings.length - 1].id) === Number(g.id);
+    };
+    const getGroupById = (id) => (groups || []).find((g) => Number(g.id) === Number(id)) || null;
+
+    const sortedGroups = flattenGroupTree(buildGroupTree(groups || []));
+
+    return sortedGroups
       .filter((group) => includeTemp || !isTempEmailGroup(group))
       .map((group) => {
         const selected = String(group.id) === String(selectedId) ? ' selected' : '';
-        const count = group.account_count ?? 0;
-        return `<option value="${escapeHtml(group.id)}"${selected}>${escapeHtml(group.name)} (${escapeHtml(count)})</option>`;
+        const count = group.descendant_account_count ?? group.account_count ?? 0;
+        
+        let label = '';
+        if (isSystem(group) || Number(group.id) === 1) {
+          label = `${group.name} (${count})`;
+        } else {
+          const level = Number(group.level || 1);
+          if (level === 1) {
+            label = `${group.name} (${count})`;
+          } else {
+            let prefix = '';
+            if (level === 3) {
+              const parent = getGroupById(group.parent_id);
+              if (parent) {
+                if (isLastChild(parent)) {
+                  prefix += '\u00A0\u00A0\u00A0';
+                } else {
+                  prefix += '│\u00A0\u00A0';
+                }
+              }
+            }
+            if (isLastChild(group)) {
+              prefix += '└─\u00A0';
+            } else {
+              prefix += '├─\u00A0';
+            }
+            label = `${prefix}${group.name} (${count})`;
+          }
+        }
+        return `<option value="${escapeHtml(group.id)}"${selected}>${escapeHtml(label)}</option>`;
       }).join('');
   }
 
@@ -602,7 +710,7 @@
         <div class="card">
           <div class="item-title">编辑账号</div>
           <label><span>邮箱</span><input id="editEmail" value="${escapeHtml(account.email || '')}"></label>
-          <label><span>账号密码</span><input id="editPassword" value="${escapeHtml(account.password || '')}"></label>
+          <label><span>账号密码</span><input id="editPassword" value="${escapeHtml(account.password || '')}" placeholder="可选"></label>
           <div class="row">
             <label><span>类型</span><select id="editProvider">${renderOptions(normalProviders, provider)}</select></label>
             <label><span>分组</span><select id="editGroup">${groupOptions(groups, account.group_id, false)}</select></label>
@@ -614,7 +722,7 @@
               <label><span>IMAP 主机</span><input id="editImapHost" value="${escapeHtml(account.imap_host || '')}"></label>
               <label><span>IMAP 端口</span><input id="editImapPort" type="number" value="${escapeHtml(account.imap_port || 993)}"></label>
             </div>
-            <label><span>IMAP 密码</span><input id="editImapPassword" value="${escapeHtml(account.imap_password || '')}"></label>
+            <label><span>IMAP 密码</span><input id="editImapPassword" value="${escapeHtml(account.imap_password || '')}" placeholder="可选"></label>
           </div>
           <div class="row">
             <label><span>状态</span><select id="editStatus">${renderOptions([['active', 'active'], ['inactive', 'inactive']], account.status || 'active')}</select></label>
@@ -642,16 +750,16 @@
       getEl('btnSaveAccount').addEventListener('click', () => runAction(config, async () => {
         const selectedProvider = valueOf('editProvider');
         const isOutlook = selectedProvider === 'outlook';
+        const passwordValue = valueOf('editPassword');
+        const imapPasswordValue = valueOf('editImapPassword');
         const body = {
           email: valueOf('editEmail'),
-          password: valueOf('editPassword'),
           client_id: valueOf('editClientId'),
           refresh_token: valueOf('editRefreshToken'),
           account_type: isOutlook ? 'outlook' : 'imap',
           provider: selectedProvider,
           imap_host: valueOf('editImapHost'),
           imap_port: toInt(valueOf('editImapPort'), 993),
-          imap_password: valueOf('editImapPassword'),
           group_id: Number(valueOf('editGroup')),
           sort_order: valueOf('editSortOrder'),
           remark: valueOf('editRemark'),
@@ -659,6 +767,12 @@
           forward_enabled: checked('editForwardEnabled'),
           aliases: valueOf('editAliases').split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean),
         };
+        if (passwordValue || !account.has_password) {
+          body.password = passwordValue;
+        }
+        if (imapPasswordValue || !account.has_imap_password) {
+          body.imap_password = imapPasswordValue;
+        }
         const payload = await Api.apiRequest(config, `/api/accounts/${accountId}`, {
           method: 'PUT',
           body,
@@ -923,7 +1037,7 @@
       return markNormalMailRead(config, email, item, folder);
     }
     if (action === 'delete') {
-      return deleteNormalMail(config, email, item);
+      return deleteNormalMail(config, email, item, folder);
     }
     return null;
   }
@@ -948,12 +1062,22 @@
     }, '正在标记已读...');
   }
 
-  async function deleteNormalMail(config, email, item) {
+  async function deleteNormalMail(config, email, item, folder) {
     if (!window.confirm('确定删除这封邮件吗？')) return;
+    const targetFolder = folder || item.folder || 'inbox';
     await runAction(config, async () => {
       const payload = await Api.apiRequest(config, '/api/emails/delete', {
         method: 'POST',
-        body: { email, ids: [item.id] },
+        body: {
+          email,
+          method: getMailItemMethod(item),
+          folder: targetFolder,
+          items: [{
+            id: item.id,
+            folder: targetFolder,
+            id_mode: item.id_mode || (getMailItemMethod(item) === 'imap' ? 'uid' : 'graph'),
+          }],
+        },
         timeoutMs: 70000,
       });
       getEl('mailDetail').innerHTML = renderResult(payload);
@@ -1522,6 +1646,8 @@
     setContent('<div class="card muted">正在加载导出...</div>');
     await withSession(async (config) => {
       const groups = await loadGroups(config);
+      const sortedGroups = flattenGroupTree(buildGroupTree(groups));
+
       setContent(`
         <div class="card">
           <label><span>二次验证密码</span><input id="exportPassword" type="password" placeholder="输入 Web 登录密码"></label>
@@ -1530,12 +1656,17 @@
             <button id="btnClearExportGroups" class="secondary-btn" type="button">清空</button>
           </div>
           <div class="list">
-            ${groups.map((group) => `
-              <label class="check-row">
-                <input type="checkbox" name="exportGroup" value="${escapeHtml(group.id)}">
-                <span>${escapeHtml(group.name)} (${escapeHtml(group.account_count ?? 0)})</span>
-              </label>
-            `).join('')}
+            ${sortedGroups.map((group) => {
+              const level = normalizeGroupLevel(group);
+              const paddingLeft = 12 + (level - 1) * 16;
+              const count = group.descendant_account_count ?? group.account_count ?? 0;
+              return `
+                <label class="check-row export-group-label" style="padding-left: ${paddingLeft}px; transition: opacity 0.15s;">
+                  <input type="checkbox" name="exportGroup" class="export-group-checkbox" value="${escapeHtml(group.id)}">
+                  <span>${escapeHtml(group.name)} (${escapeHtml(count)})</span>
+                </label>
+              `;
+            }).join('')}
           </div>
           <div class="toolbar wrap">
             <button id="btnExportAll" class="primary-btn" type="button">导出全部</button>
@@ -1545,6 +1676,75 @@
         </div>
         <textarea id="exportResult" class="result-box" readonly placeholder="导出内容会显示在这里"></textarea>
       `);
+
+      function getDescendantGroupIds(groupId) {
+        const descendants = [];
+        const queue = [Number(groupId)];
+        while (queue.length > 0) {
+          const currentId = queue.shift();
+          groups.forEach((g) => {
+            if (g.parent_id && Number(g.parent_id) === currentId) {
+              descendants.push(g.id);
+              queue.push(g.id);
+            }
+          });
+        }
+        return descendants;
+      }
+
+      function hasSelectedAncestorGroup(groupId, selectedGroupIds) {
+        let current = groups.find((g) => Number(g.id) === Number(groupId));
+        while (current && current.parent_id) {
+          const parentId = Number(current.parent_id);
+          if (selectedGroupIds.has(parentId)) {
+            return true;
+          }
+          current = groups.find((g) => Number(g.id) === parentId);
+        }
+        return false;
+      }
+
+      function syncExportGroupCheckboxStates() {
+        const checkboxes = Array.from(document.querySelectorAll('.export-group-checkbox'));
+        const selectedGroupIds = new Set(checkboxes
+          .filter((cb) => cb.checked)
+          .map((cb) => Number(cb.value)));
+
+        checkboxes.forEach((cb) => {
+          const coveredByParent = hasSelectedAncestorGroup(Number(cb.value), selectedGroupIds);
+          cb.disabled = coveredByParent;
+          if (coveredByParent) {
+            cb.checked = true;
+          }
+          const row = cb.closest('label');
+          if (row) {
+            row.style.opacity = coveredByParent ? '0.45' : '';
+            row.style.cursor = coveredByParent ? 'default' : '';
+          }
+        });
+      }
+
+      function handleExportCheckboxChange(event) {
+        const cb = event.target;
+        if (!cb) return;
+        const groupId = Number(cb.value);
+        const isChecked = cb.checked;
+
+        const descendants = getDescendantGroupIds(groupId);
+        descendants.forEach((descId) => {
+          const descCb = document.querySelector(`.export-group-checkbox[value="${descId}"]`);
+          if (descCb) {
+            descCb.checked = isChecked;
+          }
+        });
+        syncExportGroupCheckboxStates();
+      }
+
+      document.querySelectorAll('.export-group-checkbox').forEach((cb) => {
+        cb.addEventListener('change', handleExportCheckboxChange);
+      });
+      syncExportGroupCheckboxStates();
+
       async function getVerifyToken() {
         const verify = await Api.apiRequest(config, '/api/export/verify', {
           method: 'POST',
@@ -1552,27 +1752,47 @@
         });
         return verify.verify_token;
       }
+
       getEl('btnCheckAllExportGroups').addEventListener('click', () => {
-        document.querySelectorAll('[name="exportGroup"]').forEach((item) => { item.checked = true; });
+        document.querySelectorAll('.export-group-checkbox').forEach((item) => { item.checked = true; });
+        syncExportGroupCheckboxStates();
       });
+
       getEl('btnClearExportGroups').addEventListener('click', () => {
-        document.querySelectorAll('[name="exportGroup"]').forEach((item) => { item.checked = false; });
+        document.querySelectorAll('.export-group-checkbox').forEach((item) => { item.checked = false; });
+        syncExportGroupCheckboxStates();
       });
+
       getEl('btnExportAll').addEventListener('click', () => runAction(config, async () => {
         const token = await getVerifyToken();
         getEl('exportResult').value = await Api.apiTextRequest(config, `/api/accounts/export?verify_token=${encodeURIComponent(token)}`, {
           timeoutMs: 70000,
         });
       }, '正在导出全部...'));
+
       getEl('btnExportSelected').addEventListener('click', () => runAction(config, async () => {
         const token = await getVerifyToken();
-        const groupIds = Array.from(document.querySelectorAll('[name="exportGroup"]:checked')).map((item) => Number(item.value));
+        const selectedGroupIds = Array.from(document.querySelectorAll('.export-group-checkbox:checked')).map((item) => Number(item.value));
+        
+        // 过滤掉其父分组也同时被选中的子分组，避免重复导出
+        const groupIds = selectedGroupIds.filter((groupId) => {
+          let current = groups.find((g) => Number(g.id) === Number(groupId));
+          while (current && current.parent_id) {
+            if (selectedGroupIds.includes(Number(current.parent_id))) {
+              return false;
+            }
+            current = groups.find((g) => Number(g.id) === Number(current.parent_id));
+          }
+          return true;
+        });
+
         getEl('exportResult').value = await Api.apiTextRequest(config, '/api/accounts/export-selected', {
           method: 'POST',
           body: { group_ids: groupIds, verify_token: token },
           timeoutMs: 70000,
         });
       }, '正在导出选中分组...'));
+
       getEl('btnCopyExportResult').addEventListener('click', () => copyText(getEl('exportResult').value));
     }, '正在加载导出...');
   }
@@ -1648,6 +1868,12 @@
     await withSession(async (config) => {
       const payload = await Api.apiRequest(config, '/api/settings');
       const settings = payload.settings || {};
+      const forwardIntervalSeconds = settings.forward_check_interval_seconds
+        || String((toInt(settings.forward_check_interval_minutes || '5', 5) || 5) * 60);
+      const forwardExecutionMode = settings.forward_execution_mode === 'parallel' ? 'parallel' : 'serial';
+      const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel'
+        ? '0'
+        : (settings.forward_account_delay_seconds || '0');
       setContent(`
         <div class="card">
           <div class="item-title">基础与刷新</div>
@@ -1682,8 +1908,12 @@
             <label class="check-row"><input name="settingForwardChannel" value="wecom" type="checkbox" ${Array.isArray(settings.forward_channels) && settings.forward_channels.includes('wecom') ? 'checked' : ''}><span>企业微信</span></label>
           </div>
           <div class="row">
-            <label><span>检查间隔（分钟）</span><input id="settingForwardCheckInterval" type="number" value="${escapeHtml(settings.forward_check_interval_minutes || '5')}"></label>
-            <label><span>账号间隔（秒）</span><input id="settingForwardAccountDelay" type="number" value="${escapeHtml(settings.forward_account_delay_seconds || '0')}"></label>
+            <label><span>检查间隔（秒）</span><input id="settingForwardCheckIntervalSeconds" type="number" min="20" max="3600" value="${escapeHtml(forwardIntervalSeconds)}"></label>
+            <label><span>执行模式</span><select id="settingForwardExecutionMode">${renderOptions([['serial', '串行'], ['parallel', '并行']], forwardExecutionMode)}</select></label>
+          </div>
+          <div class="row">
+            <label><span>账号间隔（秒）</span><input id="settingForwardAccountDelay" type="number" min="0" max="60" value="${escapeHtml(forwardAccountDelaySeconds)}"></label>
+            <label><span>并行 worker</span><input id="settingForwardParallelWorkers" type="number" min="1" max="10" value="${escapeHtml(settings.forward_parallel_workers || '4')}"></label>
           </div>
           <div class="row">
             <label><span>邮件时间窗口（分钟）</span><input id="settingForwardWindow" type="number" value="${escapeHtml(settings.forward_email_window_minutes || '0')}"></label>
@@ -1736,10 +1966,25 @@
       getEl('btnTestWecom').addEventListener('click', () => testForwardChannel(config, 'wecom'));
       getEl('btnTestWebdav').addEventListener('click', () => testWebdav(config));
       getEl('btnUploadWebdav').addEventListener('click', () => uploadWebdav(config));
+      const syncForwardExecutionMode = () => {
+        const modeEl = getEl('settingForwardExecutionMode');
+        const delayEl = getEl('settingForwardAccountDelay');
+        if (!modeEl || !delayEl) return;
+        const isParallel = modeEl.value === 'parallel';
+        delayEl.disabled = isParallel;
+        if (isParallel) {
+          delayEl.value = '0';
+        }
+      };
+      getEl('settingForwardExecutionMode')?.addEventListener('change', syncForwardExecutionMode);
+      syncForwardExecutionMode();
     }, '正在加载设置...');
   }
 
   function collectSettingsPayload() {
+    const forwardCheckIntervalSeconds = toInt(valueOf('settingForwardCheckIntervalSeconds'), 300);
+    const forwardExecutionMode = valueOf('settingForwardExecutionMode') === 'parallel' ? 'parallel' : 'serial';
+    const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel' ? 0 : toInt(valueOf('settingForwardAccountDelay'), 0);
     return {
       gptmail_api_key: valueOf('settingGptmailKey'),
       app_timezone: valueOf('settingTimezone'),
@@ -1758,8 +2003,11 @@
       cloudflare_email_domains: valueOf('settingCloudflareEmailDomains'),
       cloudflare_admin_password: valueOf('settingCloudflareAdminPassword'),
       forward_channels: Array.from(document.querySelectorAll('[name="settingForwardChannel"]:checked')).map((item) => item.value),
-      forward_check_interval_minutes: valueOf('settingForwardCheckInterval'),
-      forward_account_delay_seconds: valueOf('settingForwardAccountDelay'),
+      forward_check_interval_seconds: forwardCheckIntervalSeconds,
+      forward_check_interval_minutes: Math.max(1, Math.min(60, Math.ceil(forwardCheckIntervalSeconds / 60))),
+      forward_execution_mode: forwardExecutionMode,
+      forward_parallel_workers: toInt(valueOf('settingForwardParallelWorkers'), 4),
+      forward_account_delay_seconds: forwardAccountDelaySeconds,
       forward_email_window_minutes: valueOf('settingForwardWindow'),
       forward_include_junkemail: checked('settingForwardJunk'),
       email_forward_recipient: valueOf('settingForwardRecipient'),

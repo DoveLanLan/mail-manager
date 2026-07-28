@@ -1,17 +1,37 @@
-        /* global accountsCache, allTags, closeAllModals, currentGroupId, currentGroupName, deleteCurrentAccount, ensureForwardingSettingsUI, escapeHtml, formatAbsoluteDateTime, getSelectedForwardChannels, groups, handleApiError, hideEditAccountModal, hideModal, hideSettingsModal, invalidateNormalMailRetentionCaches, isTempEmailGroup, isTempImportGroup, loadAccountsByGroup, loadGroups, loadTempEmails, normalizeSmtpForwardProvider, refreshVisibleAccountList, setAppTimeZone, setModalVisible, setSelectedForwardChannels, setShowAccountCreatedAt, setShowAccountSortOrder, setShowGroupId, setNormalMailLocalRetentionEnabled, showConfirmModal, showModal, showToast, syncSmtpProviderUI, toggleRefreshStrategy, updateEditAccountFields, updateImportHint */
+        /* global accountsCache, allTags, closeAllModals, closeMobilePanels, closeNavbarActionsMenu, currentGroupId, currentGroupName, deleteCurrentAccount, ensureForwardingSettingsUI, escapeHtml, formatAbsoluteDateTime, getSelectedForwardChannels, groups, handleApiError, hideEditAccountModal, hideModal, hideSettingsModal, invalidateNormalMailRetentionCaches, isTempEmailGroup, isTempImportGroup, loadAccountsByGroup, loadCloudflareChannelsForTempEmails, loadGroups, loadTempEmails, normalizeSmtpForwardProvider, refreshVisibleAccountList, setAppTimeZone, setModalVisible, setSelectedForwardChannels, setShowAccountCreatedAt, setShowAccountSortOrder, setShowGroupId, setNormalMailLocalRetentionEnabled, showConfirmModal, showModal, showToast, syncSmtpProviderUI, toggleRefreshStrategy, updateEditAccountFields, updateImportHint */
 
         // ==================== 设置相关 ====================
         let settingsScrollSyncBound = false;
         let settingsScrollSyncFrame = 0;
         let lastLoadedWebdavBackupSettings = null;
+        let cloudflareSettingsChannels = [];
         let lastNormalMailRetentionStatus = null;
+        let lastLoadedSkinSettings = null;
         let normalMailRetentionStatusPollTimer = null;
         let normalMailRetentionStatusPollDelayMs = 0;
         const NORMAL_MAIL_RETENTION_STATUS_INITIAL_POLL_MS = 2000;
         const NORMAL_MAIL_RETENTION_STATUS_MAX_POLL_MS = 10000;
+        let editAccountSecretState = {
+            accountId: ''
+        };
 
         function parseSettingsBoolean(value) {
             return String(value).toLowerCase() === 'true';
+        }
+
+        function syncForwardExecutionModeUI() {
+            const modeEl = document.getElementById('forwardExecutionMode');
+            const workersEl = document.getElementById('forwardParallelWorkers');
+            const delayEl = document.getElementById('forwardAccountDelaySeconds');
+            if (!modeEl || !workersEl) return;
+            const isParallel = modeEl.value === 'parallel';
+            workersEl.disabled = !isParallel;
+            if (delayEl) {
+                delayEl.disabled = isParallel;
+                if (isParallel) {
+                    delayEl.value = '0';
+                }
+            }
         }
 
         function formatStorageBytes(bytes) {
@@ -20,6 +40,89 @@
             if (value < 1024 * 1024) return `${(value / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
             if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1).replace(/\.0$/, '')} MB`;
             return `${(value / 1024 / 1024 / 1024).toFixed(1).replace(/\.0$/, '')} GB`;
+        }
+
+        function getSecretMask(length) {
+            return '*'.repeat(Math.max(6, Number(length) || 0));
+        }
+
+        function getSecretEyeIcon(hidden) {
+            if (!hidden) {
+                return '\
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
+                        <path d="M3 3l18 18"></path>\
+                        <path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"></path>\
+                        <path d="M9.5 5.5A10.5 10.5 0 0 1 12 5c6 0 9.5 7 9.5 7a17.6 17.6 0 0 1-2.1 3"></path>\
+                        <path d="M6.5 6.5C3.8 8.3 2.5 12 2.5 12s3.5 7 9.5 7a10 10 0 0 0 4.5-1.1"></path>\
+                    </svg>';
+            }
+            return '\
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
+                    <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>\
+                    <circle cx="12" cy="12" r="3"></circle>\
+                </svg>';
+        }
+
+        function resetEditSecretInput(inputId, buttonId, hasSavedValue, secretValue, emptyPlaceholder = '') {
+            const input = document.getElementById(inputId);
+            const button = document.getElementById(buttonId);
+            if (!input) return;
+
+            const mask = hasSavedValue ? getSecretMask((secretValue || '').length) : '';
+            input.value = mask;
+            input.placeholder = hasSavedValue ? '' : emptyPlaceholder;
+            input.dataset.secretHasSaved = hasSavedValue ? 'true' : 'false';
+            input.dataset.secretLoaded = hasSavedValue ? 'false' : 'true';
+            input.dataset.secretValue = hasSavedValue ? (secretValue || '') : '';
+            input.dataset.secretMask = mask;
+            input.dataset.secretRevealed = 'false';
+            if (button) {
+                button.style.display = hasSavedValue ? '' : 'none';
+                button.innerHTML = getSecretEyeIcon(true);
+            }
+        }
+
+        function toggleEditSecretVisibility(inputId, buttonId) {
+            const input = document.getElementById(inputId);
+            const button = document.getElementById(buttonId);
+            if (!input || !button) return;
+
+            const isRevealed = input.dataset.secretRevealed === 'true';
+            const isImap = inputId === 'editImapPassword';
+            const showLabel = isImap ? '显示 IMAP 密码' : '显示密码';
+            const hideLabel = isImap ? '隐藏 IMAP 密码' : '隐藏密码';
+
+            if (isRevealed) {
+                input.value = input.dataset.secretMask || '';
+                input.dataset.secretRevealed = 'false';
+                input.dataset.secretLoaded = 'false';
+                button.title = showLabel;
+                button.setAttribute('aria-label', showLabel);
+                button.innerHTML = getSecretEyeIcon(true);
+            } else {
+                input.value = input.dataset.secretValue || '';
+                input.dataset.secretRevealed = 'true';
+                input.dataset.secretLoaded = 'true';
+                button.title = hideLabel;
+                button.setAttribute('aria-label', hideLabel);
+                button.innerHTML = getSecretEyeIcon(false);
+            }
+        }
+
+        function clearEditAccountSecrets() {
+            resetEditSecretInput('editPassword', 'revealEditPasswordBtn', false, '', '可选');
+            resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', false, '', '');
+            editAccountSecretState = {
+                accountId: ''
+            };
+        }
+
+        function shouldSubmitSecretInput(input) {
+            if (!input) return false;
+            if (input.dataset.secretLoaded === 'true') return true;
+            if (!input.value) return false;
+            if (input.dataset.secretMask && input.value === input.dataset.secretMask) return false;
+            return true;
         }
 
         function updateNormalMailRetentionStats(status = {}) {
@@ -179,6 +282,7 @@
             scrollSettingsSection('settingsGeneralSection');
             populateTimeZoneOptions(getAppTimeZone());
             await loadSettings();
+            await loadSkinSettings();
             scheduleSettingsSidebarSync();
         }
 
@@ -193,6 +297,247 @@
             const backupVerifyInput = document.getElementById('webdavBackupVerifyPassword');
             if (backupVerifyInput) {
                 backupVerifyInput.value = '';
+            }
+        }
+
+        function setSkinSettingsStatus(message, type = '') {
+            const statusEl = document.getElementById('settingsSkinStatus');
+            if (!statusEl) return;
+            statusEl.textContent = message || '';
+            statusEl.style.display = message ? 'block' : 'none';
+            statusEl.dataset.type = type || '';
+        }
+
+        function refreshActiveSkinStylesheet(assetHash) {
+            const link = document.getElementById('activeSkinStylesheet');
+            if (!link) return;
+            const version = encodeURIComponent(assetHash || String(Date.now()));
+            link.href = `/assets/active-skin.css?v=${version}`;
+        }
+
+        function formatSkinSourceLabel(sourceType) {
+            if (sourceType === 'builtin') return '内置';
+            if (sourceType === 'upload') return '上传';
+            if (sourceType === 'git') return 'Git';
+            return sourceType || '未知';
+        }
+
+        function renderSkinList(payload = {}) {
+            lastLoadedSkinSettings = payload || {};
+            const listEl = document.getElementById('settingsSkinList');
+            const summaryEl = document.getElementById('settingsSkinActiveSummary');
+            if (!listEl || !summaryEl) return;
+
+            const activeSkin = payload.active_skin || {};
+            const activeName = activeSkin.name || activeSkin.id || 'classic';
+            summaryEl.textContent = `${activeName}（${activeSkin.id || 'classic'}）`;
+
+            const skins = Array.isArray(payload.skins) ? payload.skins : [];
+            if (!skins.length) {
+                listEl.innerHTML = '<div class="settings-note">没有可用皮肤。</div>';
+                return;
+            }
+
+            listEl.innerHTML = skins.map(skin => {
+                const skinId = String(skin.id || '').trim();
+                const isActive = !!skin.active;
+                const isInvalid = skin.status && skin.status !== 'ok';
+                const sourceType = String(skin.source_type || '');
+                const escapedId = escapeHtml(skinId);
+                const name = escapeHtml(skin.name || skinId);
+                const version = escapeHtml(skin.version || '-');
+                const sourceLabel = escapeHtml(formatSkinSourceLabel(sourceType));
+                const description = escapeHtml(skin.description || '');
+                const error = escapeHtml(skin.last_error || '');
+                const gitMeta = sourceType === 'git' && skin.git_url
+                    ? `<span>${escapeHtml(skin.git_url)}${skin.git_ref ? ` @ ${escapeHtml(skin.git_ref)}` : ''}</span>`
+                    : '';
+                const activePill = isActive ? '<span class="skin-pill skin-pill--active">当前</span>' : '';
+                const invalidPill = isInvalid ? '<span class="skin-pill skin-pill--invalid">不可用</span>' : '';
+                const activateButton = isActive || isInvalid
+                    ? ''
+                    : `<button class="btn btn-sm btn-secondary" type="button" onclick="activateSkin('${skinId}')">启用</button>`;
+                const updateButton = sourceType === 'git'
+                    ? `<button class="btn btn-sm btn-secondary" type="button" onclick="updateGitSkin('${skinId}')">更新</button>`
+                    : '';
+                const deleteButton = !skin.builtin && !isActive
+                    ? `<button class="btn btn-sm btn-danger" type="button" onclick="deleteSkin('${skinId}')">删除</button>`
+                    : '';
+
+                return `
+                    <article class="skin-card ${isActive ? 'is-active' : ''} ${isInvalid ? 'is-invalid' : ''}">
+                        <div>
+                            <div class="skin-card__title">
+                                <span>${name}</span>
+                                ${activePill}
+                                ${invalidPill}
+                            </div>
+                            <div class="skin-card__meta">
+                                <span>ID：${escapedId}</span>
+                                <span>版本：${version}</span>
+                                <span>来源：${sourceLabel}</span>
+                                ${description ? `<span>${description}</span>` : ''}
+                                ${gitMeta}
+                            </div>
+                            ${error ? `<div class="skin-card__error">${error}</div>` : ''}
+                        </div>
+                        <div class="skin-card__actions">
+                            ${activateButton}
+                            ${updateButton}
+                            ${deleteButton}
+                        </div>
+                    </article>
+                `;
+            }).join('');
+        }
+
+        async function loadSkinSettings() {
+            const listEl = document.getElementById('settingsSkinList');
+            if (listEl) {
+                listEl.innerHTML = '<div class="settings-note">正在加载皮肤列表...</div>';
+            }
+            try {
+                const response = await fetch('/api/skins', { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '加载皮肤列表失败');
+                }
+                renderSkinList(data);
+                setSkinSettingsStatus('');
+                return data;
+            } catch (error) {
+                setSkinSettingsStatus(error.message || '加载皮肤列表失败', 'error');
+                if (listEl) {
+                    listEl.innerHTML = '<div class="settings-note">皮肤列表加载失败。</div>';
+                }
+                return null;
+            }
+        }
+
+        async function activateSkin(skinId) {
+            const normalizedId = String(skinId || '').trim();
+            if (!normalizedId) {
+                showToast('皮肤 ID 无效', 'error');
+                return;
+            }
+            try {
+                const response = await fetch(`/api/skins/${encodeURIComponent(normalizedId)}/activate`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '启用皮肤失败');
+                }
+                refreshActiveSkinStylesheet(data.asset_hash);
+                showToast('皮肤已启用', 'success');
+                await loadSkinSettings();
+            } catch (error) {
+                showToast(error.message || '启用皮肤失败', 'error');
+                setSkinSettingsStatus(error.message || '启用皮肤失败', 'error');
+            }
+        }
+
+        async function uploadSkinPackage() {
+            const input = document.getElementById('settingsSkinUploadFile');
+            const file = input?.files?.[0];
+            if (!file) {
+                showToast('请选择 zip 皮肤包', 'error');
+                return;
+            }
+            const formData = new FormData();
+            formData.append('skin', file);
+            setSkinSettingsStatus('正在安装上传皮肤...', 'pending');
+            try {
+                const response = await fetch('/api/skins/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '安装上传皮肤失败');
+                }
+                if (input) input.value = '';
+                showToast('皮肤已安装', 'success');
+                setSkinSettingsStatus('');
+                await loadSkinSettings();
+            } catch (error) {
+                showToast(error.message || '安装上传皮肤失败', 'error');
+                setSkinSettingsStatus(error.message || '安装上传皮肤失败', 'error');
+            }
+        }
+
+        async function installGitSkin() {
+            const gitUrl = document.getElementById('settingsSkinGitUrl')?.value.trim() || '';
+            const gitRef = document.getElementById('settingsSkinGitRef')?.value.trim() || '';
+            if (!gitUrl) {
+                showToast('请输入 Git 仓库地址', 'error');
+                return;
+            }
+            setSkinSettingsStatus('正在安装 Git 皮肤...', 'pending');
+            try {
+                const response = await fetch('/api/skins/git/install', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ git_url: gitUrl, git_ref: gitRef })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '安装 Git 皮肤失败');
+                }
+                showToast('Git 皮肤已安装', 'success');
+                setSkinSettingsStatus('');
+                await loadSkinSettings();
+            } catch (error) {
+                showToast(error.message || '安装 Git 皮肤失败', 'error');
+                setSkinSettingsStatus(error.message || '安装 Git 皮肤失败', 'error');
+            }
+        }
+
+        async function updateGitSkin(skinId) {
+            const normalizedId = String(skinId || '').trim();
+            if (!normalizedId) return;
+            setSkinSettingsStatus('正在更新 Git 皮肤...', 'pending');
+            try {
+                const response = await fetch(`/api/skins/${encodeURIComponent(normalizedId)}/git/update`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '更新 Git 皮肤失败');
+                }
+                if (lastLoadedSkinSettings?.active_skin_id === normalizedId) {
+                    refreshActiveSkinStylesheet(data.skin?.asset_hash);
+                }
+                showToast('Git 皮肤已更新', 'success');
+                setSkinSettingsStatus('');
+                await loadSkinSettings();
+            } catch (error) {
+                showToast(error.message || '更新 Git 皮肤失败', 'error');
+                setSkinSettingsStatus(error.message || '更新 Git 皮肤失败', 'error');
+            }
+        }
+
+        async function deleteSkin(skinId) {
+            const normalizedId = String(skinId || '').trim();
+            if (!normalizedId) return;
+            const confirmed = await showConfirmModal(
+                '确定要删除这个自定义皮肤吗？',
+                { title: '删除皮肤', confirmText: '确认删除' }
+            );
+            if (!confirmed) return;
+            try {
+                const response = await fetch(`/api/skins/${encodeURIComponent(normalizedId)}`, {
+                    method: 'DELETE'
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '删除皮肤失败');
+                }
+                showToast('皮肤已删除', 'success');
+                await loadSkinSettings();
+            } catch (error) {
+                showToast(error.message || '删除皮肤失败', 'error');
+                setSkinSettingsStatus(error.message || '删除皮肤失败', 'error');
             }
         }
 
@@ -690,62 +1035,50 @@
         }
 
         function renderImportTagOptions() {
-            const container = document.getElementById('importTagOptions');
+            const container = document.getElementById('importTagFilterOptions');
             if (!container) return;
 
             const tags = typeof allTags !== 'undefined' && Array.isArray(allTags) ? allTags : [];
-            if (!tags.length) {
-                container.innerHTML = '<div class="import-tag-empty">暂无标签</div>';
-                updateImportTagSummary();
-                return;
-            }
-
-            container.innerHTML = tags.map(tag => `
-                <label class="import-tag-option">
-                    <input type="checkbox" class="import-tag-checkbox" value="${tag.id}" onchange="updateImportTagSummary()">
-                    <span class="import-tag-dot" style="background-color: ${escapeHtml(tag.color || '#9ca3af')};"></span>
-                    <span>${escapeHtml(tag.name || '')}</span>
-                </label>
-            `).join('');
+            container.innerHTML = buildTagFilterOptionsHtml(tags, [], 'updateImportTagSummary');
             updateImportTagSummary();
         }
 
         function updateImportTagSummary() {
-            const summaryEl = document.getElementById('importTagSummary');
-            const countEl = document.getElementById('importTagCount');
+            const summaryEl = document.getElementById('importTagFilterTriggerText');
+            const countEl = document.getElementById('importTagFilterTriggerCount');
             if (!summaryEl || !countEl) return;
 
-            const selected = Array.from(document.querySelectorAll('.import-tag-checkbox:checked'))
-                .map(checkbox => {
-                    const label = checkbox.closest('.import-tag-option');
-                    return label ? label.textContent.trim() : '';
-                })
-                .filter(Boolean);
-
-            if (!selected.length) {
-                summaryEl.textContent = '未选择标签';
-                countEl.style.display = 'none';
-                countEl.textContent = '';
-                return;
-            }
-
-            summaryEl.textContent = selected.length <= 2 ? selected.join('、') : `已选 ${selected.length} 个标签`;
-            countEl.style.display = 'inline-flex';
-            countEl.textContent = String(selected.length);
+            const container = document.getElementById('importTagFilterOptions');
+            const selectedIds = getTagFilterSelectedIds(container);
+            const tags = typeof allTags !== 'undefined' && Array.isArray(allTags) ? allTags : [];
+            const selectedItems = selectedIds.map(id => tags.find(t => t.id === id)).filter(Boolean);
+            updateTagFilterSummaryText(summaryEl, countEl, selectedItems, '未选择标签');
         }
 
         function toggleImportTagDropdown(event) {
             event?.stopPropagation();
-            const dropdown = document.getElementById('importTagDropdown');
-            if (!dropdown) return;
-            dropdown.classList.toggle('open');
+            const dropdown = document.getElementById('importTagFilterDropdown');
+            const searchInput = document.getElementById('importTagFilterSearchInput');
+            toggleTagFilterDropdownState(dropdown, searchInput, '');
+        }
+
+        function filterImportTagOptions(keyword) {
+            const container = document.getElementById('importTagFilterOptions');
+            filterTagFilterOptions(keyword, container);
+        }
+
+        function clearImportTagSelection(event) {
+            event?.stopPropagation();
+            const dropdown = document.getElementById('importTagFilterDropdown');
+            clearTagFilterCheckboxes(dropdown);
+            updateImportTagSummary();
         }
 
         function resetImportDefaults() {
             const remarkInput = document.getElementById('importRemark');
             const statusSelect = document.getElementById('importStatus');
             const forwardInput = document.getElementById('importForwardEnabled');
-            const tagDropdown = document.getElementById('importTagDropdown');
+            const tagDropdown = document.getElementById('importTagFilterDropdown');
 
             if (remarkInput) remarkInput.value = '';
             if (statusSelect) statusSelect.value = 'active';
@@ -755,9 +1088,77 @@
         }
 
         function getImportSelectedTagIds() {
-            return Array.from(document.querySelectorAll('.import-tag-checkbox:checked'))
-                .map(checkbox => parseInt(checkbox.value, 10))
-                .filter(Number.isFinite);
+            const container = document.getElementById('importTagFilterOptions');
+            return getTagFilterSelectedIds(container);
+        }
+
+        // ==================== 编辑账号模态框标签 ====================
+
+        function renderEditTagOptions(selectedTagIds) {
+            const container = document.getElementById('editTagFilterOptions');
+            if (!container) return;
+
+            const tags = typeof allTags !== 'undefined' && Array.isArray(allTags) ? allTags : [];
+            container.innerHTML = buildTagFilterOptionsHtml(tags, selectedTagIds || [], 'updateEditTagSummary');
+            updateEditTagSummary();
+        }
+
+        function updateEditTagSummary() {
+            const summaryEl = document.getElementById('editTagFilterTriggerText');
+            const countEl = document.getElementById('editTagFilterTriggerCount');
+            if (!summaryEl || !countEl) return;
+
+            const container = document.getElementById('editTagFilterOptions');
+            const selectedIds = getTagFilterSelectedIds(container);
+            const tags = typeof allTags !== 'undefined' && Array.isArray(allTags) ? allTags : [];
+            const selectedItems = selectedIds.map(id => tags.find(t => t.id === id)).filter(Boolean);
+            updateTagFilterSummaryText(summaryEl, countEl, selectedItems, '未选择标签');
+        }
+
+        function toggleEditTagDropdown(event) {
+            event?.stopPropagation();
+            const dropdown = document.getElementById('editTagFilterDropdown');
+            const searchInput = document.getElementById('editTagFilterSearchInput');
+            toggleTagFilterDropdownState(dropdown, searchInput, '');
+        }
+
+        function filterEditTagOptions(keyword) {
+            const container = document.getElementById('editTagFilterOptions');
+            filterTagFilterOptions(keyword, container);
+        }
+
+        function clearEditTagSelection(event) {
+            event?.stopPropagation();
+            const dropdown = document.getElementById('editTagFilterDropdown');
+            clearTagFilterCheckboxes(dropdown);
+            updateEditTagSummary();
+        }
+
+        function getEditSelectedTagIds() {
+            const container = document.getElementById('editTagFilterOptions');
+            return getTagFilterSelectedIds(container);
+        }
+
+        async function loadCloudflareChannelsForImport(forceRefresh = false) {
+            const select = document.getElementById('importCloudflareChannelSelect');
+            if (!select) return [];
+            const channels = typeof loadCloudflareChannelsForTempEmails === 'function'
+                ? await loadCloudflareChannelsForTempEmails(forceRefresh)
+                : [];
+            const enabledChannels = (Array.isArray(channels) ? channels : []).filter(channel => channel.enabled);
+            if (!enabledChannels.length) {
+                select.innerHTML = '<option value="">请先在设置中配置 Cloudflare 渠道</option>';
+                return [];
+            }
+            const currentValue = select.value;
+            select.innerHTML = enabledChannels.map(channel => (
+                `<option value="${Number(channel.id)}">${escapeHtml(channel.name || `#${channel.id}`)}</option>`
+            )).join('');
+            const defaultChannel = enabledChannels.find(channel => channel.is_default) || enabledChannels[0];
+            select.value = enabledChannels.some(channel => String(channel.id) === currentValue)
+                ? currentValue
+                : String(defaultChannel.id);
+            return enabledChannels;
         }
 
         function showAddAccountModal() {
@@ -775,14 +1176,24 @@
             if (currentGroupId) {
                 document.getElementById('importGroupSelect').value = currentGroupId;
             }
+            const cloudflareMode = document.getElementById('importCloudflareImportMode');
+            if (cloudflareMode) {
+                cloudflareMode.value = 'auto';
+            }
             resetImportDefaults();
             updateImportHint();
+            loadCloudflareChannelsForImport();
         }
 
         async function addAccount() {
             const input = document.getElementById('accountInput').value.trim();
             const groupId = parseInt(document.getElementById('importGroupSelect').value);
             const provider = document.getElementById('importProviderSelect')?.value || 'outlook';
+            const isTempGroup = isTempImportGroup();
+            const tempProvider = isTempGroup ? (document.getElementById('importChannelSelect').value || 'gptmail') : '';
+            const cloudflareMode = document.getElementById('importCloudflareImportMode')?.value || 'auto';
+            const isCloudflareAutoImport = isTempGroup && tempProvider === 'cloudflare' && cloudflareMode === 'auto';
+            const cloudflareChannelId = document.getElementById('importCloudflareChannelSelect')?.value || '';
             const imapHost = document.getElementById('importImapHost')?.value.trim() || '';
             const imapPort = parseInt(document.getElementById('importImapPort')?.value || '993', 10);
             const forwardEnabled = !!document.getElementById('importForwardEnabled')?.checked;
@@ -791,14 +1202,17 @@
             const tagIds = getImportSelectedTagIds();
             const importButton = document.querySelector('#addAccountModal .btn.btn-primary');
 
-            if (!input) {
+            if (!input && !isCloudflareAutoImport) {
                 showToast('请输入账号信息', 'error');
                 return;
             }
 
-            const isTempGroup = isTempImportGroup();
             if (!isTempGroup && provider === 'custom' && !imapHost) {
                 showToast('自定义 IMAP 必须填写服务器地址', 'error');
+                return;
+            }
+            if (isTempGroup && tempProvider === 'cloudflare' && !cloudflareChannelId) {
+                showToast('请选择 Cloudflare 渠道', 'error');
                 return;
             }
 
@@ -809,12 +1223,96 @@
                 }
                 let response;
                 if (isTempGroup) {
-                    const tempProvider = document.getElementById('importChannelSelect').value || 'gptmail';
-                    response = await fetch('/api/temp-emails/import', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ account_string: input, provider: tempProvider })
-                    });
+                    const endpoint = isCloudflareAutoImport
+                        ? '/api/temp-emails/import-cloudflare-addresses'
+                        : '/api/temp-emails/import';
+                    const payload = {
+                        provider: tempProvider,
+                        tag_ids: tagIds
+                    };
+                    if (!isCloudflareAutoImport) {
+                        payload.account_string = input;
+                    }
+                    if (tempProvider === 'cloudflare') {
+                        payload.cloudflare_channel_id = cloudflareChannelId;
+                    }
+
+                    // 自动导入支持流式进度
+                    if (isCloudflareAutoImport) {
+                        payload.stream = true;
+                        const progressHint = document.getElementById('importFormatExample');
+                        if (progressHint) {
+                            progressHint.style.display = '';
+                            progressHint.textContent = '正在拉取地址列表...';
+                        }
+
+                        response = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        // 处理 Server-Sent Events 流
+                        if (response.headers.get('content-type')?.includes('text/event-stream')) {
+                            const reader = response.body.getReader();
+                            const decoder = new TextDecoder();
+                            let buffer = '';
+                            let lastData = null;
+
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+
+                                buffer += decoder.decode(value, { stream: true });
+                                const lines = buffer.split('\n\n');
+                                buffer = lines.pop() || '';
+
+                                for (const line of lines) {
+                                    if (line.startsWith('data: ')) {
+                                        try {
+                                            const eventData = JSON.parse(line.substring(6));
+                                            lastData = eventData;
+
+                                            if (eventData.type === 'progress' && progressHint) {
+                                                const percent = eventData.total > 0
+                                                    ? Math.round((eventData.imported / eventData.total) * 100)
+                                                    : 0;
+                                                progressHint.textContent = `导入进度: ${eventData.imported}/${eventData.total} (${percent}%) - 新增 ${eventData.added}，更新 ${eventData.updated}`;
+                                            } else if (eventData.type === 'complete') {
+                                                if (progressHint) {
+                                                    progressHint.textContent = eventData.success
+                                                        ? `✅ ${eventData.message || '导入完成'}`
+                                                        : `❌ ${eventData.error || '导入失败'}`;
+                                                }
+                                            }
+                                        } catch (e) {
+                                            console.error('Parse SSE error:', e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 使用最后收到的完整数据
+                            if (lastData && lastData.type === 'complete') {
+                                if (lastData.success) {
+                                    showToast(lastData.message, 'success');
+                                    hideAddAccountModal();
+                                    delete accountsCache[groupId];
+                                    await loadGroups();
+                                    if (currentGroupId === groupId) await loadAccountsByGroup(groupId);
+                                } else {
+                                    handleApiError(lastData, '导入临时邮箱失败');
+                                }
+                                return;
+                            }
+                        }
+                    } else {
+                        response = await fetch(endpoint, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+                    }
                 } else {
                     response = await fetch('/api/accounts', {
                         method: 'POST',
@@ -866,12 +1364,13 @@
                 if (data.success) {
                     closeAllModals();
                     const acc = data.account;
+                    editAccountSecretState.accountId = String(acc.id || '');
                     document.getElementById('editAccountId').value = acc.id;
                     document.getElementById('editEmail').value = acc.email || '';
-                    document.getElementById('editPassword').value = acc.password || '';
+                    resetEditSecretInput('editPassword', 'revealEditPasswordBtn', !!acc.has_password, acc.password || '', '可选');
                     document.getElementById('editClientId').value = acc.client_id || '';
                     document.getElementById('editRefreshToken').value = acc.refresh_token || '';
-                    document.getElementById('editImapPassword').value = acc.imap_password || '';
+                    resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', !!acc.has_imap_password, acc.imap_password || '', '');
                     document.getElementById('editImapHost').value = acc.imap_host || '';
                     document.getElementById('editImapPort').value = acc.imap_port || 993;
                     document.getElementById('editGroupSelect').value = acc.group_id || 1;
@@ -889,6 +1388,8 @@
                         document.getElementById('editProviderSelect').value = acc.provider || (acc.account_type === 'imap' ? 'custom' : 'outlook');
                     }
                     updateEditAccountFields();
+                    const accTags = Array.isArray(acc.tags) ? acc.tags.map(t => t.id) : [];
+                    renderEditTagOptions(accTags);
                     setModalVisible('editAccountModal', true);
                 }
             } catch (error) {
@@ -904,17 +1405,22 @@
             const isOutlook = provider === 'outlook';
             const imapPort = parseInt(document.getElementById('editImapPort')?.value || '993', 10);
             const sortOrder = parseInt(document.getElementById('editSortOrder')?.value || '0', 10);
+            const passwordInput = document.getElementById('editPassword');
+            const imapPasswordInput = document.getElementById('editImapPassword');
+            const imapPasswordValue = imapPasswordInput?.value || '';
+            const imapPasswordLockedWithSavedValue = (
+                imapPasswordInput?.dataset.secretHasSaved === 'true'
+                && imapPasswordInput?.dataset.secretLoaded !== 'true'
+            );
 
             const data = {
                 email: document.getElementById('editEmail').value.trim(),
-                password: document.getElementById('editPassword').value,
                 client_id: document.getElementById('editClientId').value.trim(),
                 refresh_token: document.getElementById('editRefreshToken').value.trim(),
                 account_type: isOutlook ? 'outlook' : 'imap',
                 provider,
                 imap_host: document.getElementById('editImapHost')?.value.trim() || '',
                 imap_port: Number.isFinite(imapPort) ? imapPort : 993,
-                imap_password: document.getElementById('editImapPassword')?.value || '',
                 group_id: newGroupId,
                 proxy_url: document.getElementById('editProxyUrl')?.value.trim() || '',
                 fallback_proxy_url_1: document.getElementById('editFallbackProxyUrl1')?.value.trim() || '',
@@ -926,8 +1432,15 @@
                     .map(item => item.trim())
                     .filter(Boolean),
                 status: document.getElementById('editStatus').value,
-                forward_enabled: !!document.getElementById('editForwardEnabled')?.checked
+                forward_enabled: !!document.getElementById('editForwardEnabled')?.checked,
+                tag_ids: getEditSelectedTagIds()
             };
+            if (shouldSubmitSecretInput(passwordInput)) {
+                data.password = passwordInput.value;
+            }
+            if (shouldSubmitSecretInput(imapPasswordInput)) {
+                data.imap_password = imapPasswordValue;
+            }
 
             if (isOutlook) {
                 if (!data.email || !data.client_id || !data.refresh_token) {
@@ -935,7 +1448,7 @@
                     return;
                 }
             } else {
-                if (!data.email || !data.imap_password) {
+                if (!data.email || (!imapPasswordValue && !imapPasswordLockedWithSavedValue)) {
                     showToast('邮箱和 IMAP 密码不能为空', 'error');
                     return;
                 }
@@ -976,6 +1489,277 @@
             }
         }
 
+        function setCloudflareChannelFormMode(isEditing) {
+            const saveBtn = document.getElementById('saveCloudflareChannelBtn');
+            const resetBtn = document.getElementById('resetCloudflareChannelBtn');
+            const deleteBtn = document.getElementById('deleteCloudflareChannelBtn');
+            const testBtn = document.getElementById('testCloudflareChannelBtn');
+            const testResult = document.getElementById('cloudflareChannelTestResult');
+            if (saveBtn) saveBtn.textContent = isEditing ? '保存渠道' : '创建渠道';
+            if (resetBtn) resetBtn.textContent = isEditing ? '新建渠道' : '清空表单';
+            if (deleteBtn) deleteBtn.style.display = isEditing ? '' : 'none';
+            if (testBtn) testBtn.style.display = isEditing ? '' : 'none';
+            if (testResult) testResult.style.display = 'none';
+        }
+
+        function resetCloudflareChannelForm() {
+            const idInput = document.getElementById('settingsCloudflareChannelId');
+            if (!idInput) return;
+            idInput.value = '';
+            document.getElementById('settingsCloudflareChannelName').value = '';
+            document.getElementById('settingsCloudflareWorkerDomain').value = '';
+            document.getElementById('settingsCloudflareEmailDomains').value = '';
+            document.getElementById('settingsCloudflareAdminPassword').value = '';
+            document.getElementById('settingsCloudflareAdminPassword').placeholder = '对应 Cloudflare Temp Email 的 ADMIN_PASSWORD';
+            document.getElementById('settingsCloudflareEnabled').checked = true;
+            document.getElementById('settingsCloudflareDefault').checked = cloudflareSettingsChannels.length === 0;
+            setCloudflareChannelFormMode(false);
+        }
+
+        function renderCloudflareChannelsForSettings() {
+            const list = document.getElementById('settingsCloudflareChannelList');
+            if (!list) return;
+            if (!cloudflareSettingsChannels.length) {
+                list.innerHTML = '<div class="form-hint">暂无 Cloudflare 渠道</div>';
+                return;
+            }
+            list.innerHTML = cloudflareSettingsChannels.map(channel => `
+                <div class="cloudflare-channel-row">
+                    <div>
+                        <div class="cloudflare-channel-row-title">${escapeHtml(channel.name || `#${channel.id}`)}</div>
+                        <div class="cloudflare-channel-row-meta">
+                            <span class="cloudflare-channel-pill">${escapeHtml(channel.worker_domain || '未配置 Worker')}</span>
+                            <span class="cloudflare-channel-pill">${escapeHtml((channel.email_domains || []).join(', ') || '未配置域名')}</span>
+                            <span class="cloudflare-channel-pill">${channel.enabled ? '启用' : '停用'}</span>
+                            ${channel.is_default ? '<span class="cloudflare-channel-pill">默认</span>' : ''}
+                            <span class="cloudflare-channel-pill">${Number(channel.reference_count || 0)} 个邮箱</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-secondary" type="button" onclick="editCloudflareChannel(${Number(channel.id)})">编辑</button>
+                </div>
+            `).join('');
+        }
+
+        async function loadCloudflareChannelsForSettings() {
+            const list = document.getElementById('settingsCloudflareChannelList');
+            if (list) list.innerHTML = '<div class="form-hint">加载中...</div>';
+            try {
+                const response = await fetch('/api/cloudflare/channels');
+                const data = await response.json();
+                cloudflareSettingsChannels = data.success && Array.isArray(data.channels) ? data.channels : [];
+                renderCloudflareChannelsForSettings();
+                resetCloudflareChannelForm();
+            } catch (error) {
+                cloudflareSettingsChannels = [];
+                if (list) list.innerHTML = '<div class="form-hint">加载失败</div>';
+            }
+        }
+
+        function editCloudflareChannel(channelId) {
+            const channel = cloudflareSettingsChannels.find(item => Number(item.id) === Number(channelId));
+            if (!channel) return;
+            document.getElementById('settingsCloudflareChannelId').value = String(channel.id);
+            document.getElementById('settingsCloudflareChannelName').value = channel.name || '';
+            document.getElementById('settingsCloudflareWorkerDomain').value = channel.worker_domain || '';
+            document.getElementById('settingsCloudflareEmailDomains').value = (channel.email_domains || []).join(', ');
+            document.getElementById('settingsCloudflareAdminPassword').value = '';
+            document.getElementById('settingsCloudflareAdminPassword').placeholder = channel.admin_password_configured ? '已保存，留空不修改' : '对应 Cloudflare Temp Email 的 ADMIN_PASSWORD';
+            document.getElementById('settingsCloudflareEnabled').checked = !!channel.enabled;
+            document.getElementById('settingsCloudflareDefault').checked = !!channel.is_default;
+            setCloudflareChannelFormMode(true);
+        }
+
+        async function testCloudflareChannelConnection() {
+            const channelId = document.getElementById('settingsCloudflareChannelId')?.value || '';
+            if (!channelId) {
+                showToast('请先选择要测试的渠道', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('testCloudflareChannelBtn');
+            const resultContainer = document.getElementById('cloudflareChannelTestResult');
+            const resultText = document.getElementById('cloudflareChannelTestResultText');
+            const originalText = btn?.textContent || '';
+
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '测试中...';
+            }
+            if (resultContainer) {
+                resultContainer.style.display = '';
+            }
+            if (resultText) {
+                resultText.textContent = '正在测试 Cloudflare 管理员 API 连接...';
+                resultText.className = 'form-hint';
+            }
+
+            try {
+                const response = await fetch(`/api/cloudflare/channels/${encodeURIComponent(channelId)}/test`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+
+                if (resultText) {
+                    let html = `<strong>${escapeHtml(data.message || '测试完成')}</strong><br><br>`;
+                    if (data.tests && Array.isArray(data.tests)) {
+                        html += '<ul style="margin: 0; padding-left: 20px;">';
+                        for (const test of data.tests) {
+                            const icon = test.success ? '✅' : '❌';
+                            html += `<li>${icon} ${escapeHtml(test.test)}`;
+                            if (test.success) {
+                                if (test.domains) {
+                                    html += `: ${test.domains.length} 个域名`;
+                                    if (test.domains.length > 0) {
+                                        html += ` (${test.domains.slice(0, 3).map(d => escapeHtml(d)).join(', ')}${test.domains.length > 3 ? '...' : ''})`;
+                                    }
+                                } else if (test.count !== undefined) {
+                                    html += `: 总计 ${test.count} 条记录`;
+                                }
+                            } else if (test.error) {
+                                html += `: ${escapeHtml(test.error)}`;
+                            }
+                            html += '</li>';
+                        }
+                        html += '</ul>';
+                    }
+                    resultText.innerHTML = html;
+                    resultText.className = data.success ? 'form-hint success-text' : 'form-hint error-text';
+                }
+
+                if (data.success) {
+                    showToast('连接测试通过', 'success');
+                } else {
+                    showToast(data.message || '连接测试失败', 'error');
+                }
+            } catch (error) {
+                if (resultText) {
+                    resultText.textContent = `测试失败: ${error.message}`;
+                    resultText.className = 'form-hint error-text';
+                }
+                showToast('测试连接失败', 'error');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            }
+        }
+
+        async function saveCloudflareChannel() {
+            const channelId = document.getElementById('settingsCloudflareChannelId')?.value || '';
+            const payload = {
+                name: document.getElementById('settingsCloudflareChannelName')?.value.trim() || '',
+                worker_domain: document.getElementById('settingsCloudflareWorkerDomain')?.value.trim() || '',
+                email_domains: document.getElementById('settingsCloudflareEmailDomains')?.value.trim() || '',
+                admin_password: document.getElementById('settingsCloudflareAdminPassword')?.value.trim() || '',
+                enabled: !!document.getElementById('settingsCloudflareEnabled')?.checked,
+                is_default: !!document.getElementById('settingsCloudflareDefault')?.checked
+            };
+            if (!payload.name || !payload.worker_domain) {
+                showToast('请填写渠道名称和 Worker 域名', 'error');
+                return;
+            }
+            if (!channelId && !payload.admin_password) {
+                showToast('新建渠道必须填写管理员密码', 'error');
+                return;
+            }
+            try {
+                const response = await fetch(channelId ? `/api/cloudflare/channels/${encodeURIComponent(channelId)}` : '/api/cloudflare/channels', {
+                    method: channelId ? 'PUT' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, '保存 Cloudflare 渠道失败');
+                    return;
+                }
+                showToast(data.message || 'Cloudflare 渠道已保存', 'success');
+                delete accountsCache.cloudflareChannels;
+                delete accountsCache.temp;
+                await loadCloudflareChannelsForSettings();
+                if (currentGroupId) loadTempEmails(true);
+            } catch (error) {
+                showToast('保存 Cloudflare 渠道失败', 'error');
+            }
+        }
+
+        async function deleteCloudflareChannel() {
+            const channelId = document.getElementById('settingsCloudflareChannelId')?.value || '';
+            if (!channelId) return;
+            if (!(await showConfirmModal('确定要删除这个 Cloudflare 渠道吗？', { title: '删除渠道', confirmText: '确认删除' }))) {
+                return;
+            }
+            try {
+                const response = await fetch(`/api/cloudflare/channels/${encodeURIComponent(channelId)}`, { method: 'DELETE' });
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, '删除 Cloudflare 渠道失败');
+                    return;
+                }
+                showToast(data.message || 'Cloudflare 渠道已删除', 'success');
+                delete accountsCache.cloudflareChannels;
+                delete accountsCache.temp;
+                await loadCloudflareChannelsForSettings();
+                if (currentGroupId) loadTempEmails(true);
+            } catch (error) {
+                showToast('删除 Cloudflare 渠道失败', 'error');
+            }
+        }
+
+        async function testCloudflareAiUsernames() {
+            const resultEl = document.getElementById('settingsCloudflareAiTestResult');
+            const btn = document.getElementById('testCloudflareAiBtn');
+            const originalText = btn?.textContent || '';
+            const apiKey = document.getElementById('settingsCloudflareAiApiKey')?.value.trim() || '';
+            const count = parseInt(document.getElementById('settingsCloudflareAiTestCount')?.value || '5', 10);
+            const body = {
+                api_url: document.getElementById('settingsCloudflareAiApiUrl')?.value.trim() || '',
+                model: document.getElementById('settingsCloudflareAiModel')?.value.trim() || '',
+                prompt: document.getElementById('settingsCloudflareAiPrompt')?.value.trim() || '',
+                count: Number.isNaN(count) ? 5 : count
+            };
+            if (apiKey) {
+                body.api_key = apiKey;
+            }
+
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '测试中...';
+            }
+            if (resultEl) {
+                resultEl.textContent = '测试中...';
+            }
+
+            try {
+                const response = await fetch('/api/cloudflare/ai-usernames/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, 'AI 用户名测试失败');
+                    if (resultEl) resultEl.textContent = data.error || '测试失败';
+                    return;
+                }
+                const usernames = Array.isArray(data.usernames) ? data.usernames : [];
+                if (resultEl) {
+                    resultEl.textContent = usernames.length ? usernames.join(', ') : '未返回可用用户名';
+                }
+                showToast('AI 用户名测试完成', 'success');
+            } catch (error) {
+                showToast('AI 用户名测试失败', 'error');
+                if (resultEl) resultEl.textContent = '测试失败';
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            }
+        }
+
         async function loadSettings() {
             ensureForwardingSettingsUI();
             try {
@@ -990,11 +1774,19 @@
                     document.getElementById('settingsExternalApiKey').value = data.settings.external_api_key || '';
                     document.getElementById('settingsDuckmailBaseUrl').value = data.settings.duckmail_base_url || '';
                     document.getElementById('settingsDuckmailApiKey').value = data.settings.duckmail_api_key || '';
-                    document.getElementById('settingsCloudflareWorkerDomain').value = data.settings.cloudflare_worker_domain || '';
-                    document.getElementById('settingsCloudflareEmailDomains').value = data.settings.cloudflare_email_domains || '';
-                    document.getElementById('settingsCloudflareAdminPassword').value = data.settings.cloudflare_admin_password || '';
+                    document.getElementById('settingsCloudflareAiEnabled').checked = String(data.settings.cloudflare_ai_username_enabled) === 'true';
+                    document.getElementById('settingsCloudflareAiApiUrl').value = data.settings.cloudflare_ai_username_api_url || '';
+                    document.getElementById('settingsCloudflareAiModel').value = data.settings.cloudflare_ai_username_model || '';
+                    document.getElementById('settingsCloudflareAiApiKey').value = '';
+                    document.getElementById('settingsCloudflareAiApiKey').placeholder = data.settings.cloudflare_ai_username_api_key_configured ? '已保存，留空不修改' : '输入 AI API Key';
+                    document.getElementById('settingsCloudflareAiApiKeyHint').textContent = data.settings.cloudflare_ai_username_api_key_configured ? '已配置' : '未配置';
+                    document.getElementById('settingsCloudflareAiClearApiKey').checked = false;
+                    document.getElementById('settingsCloudflareAiPrompt').value = data.settings.cloudflare_ai_username_prompt || '';
+                    document.getElementById('settingsCloudflareAiTestResult').textContent = '未测试';
                     document.getElementById('settingsAppTimezone').value = appTimeZone;
                     document.getElementById('settingsPassword').value = '';
+                    const currentPasswordInput = document.getElementById('settingsCurrentPassword');
+                    if (currentPasswordInput) currentPasswordInput.value = '';
 
                     document.getElementById('refreshIntervalDays').value = data.settings.refresh_interval_days || '30';
                     document.getElementById('refreshDelaySeconds').value = data.settings.refresh_delay_seconds || '5';
@@ -1006,7 +1798,10 @@
                     const retentionEnabled = parseSettingsBoolean(data.settings.normal_mail_local_retention_enabled);
                     document.getElementById('normalMailLocalRetentionEnabled').checked = retentionEnabled;
                     setNormalMailLocalRetentionEnabled(retentionEnabled);
-                    document.getElementById('forwardCheckIntervalMinutes').value = data.settings.forward_check_interval_minutes || '5';
+                    const fallbackForwardSeconds = String((parseInt(data.settings.forward_check_interval_minutes || '5', 10) || 5) * 60);
+                    document.getElementById('forwardCheckIntervalSeconds').value = data.settings.forward_check_interval_seconds || fallbackForwardSeconds;
+                    document.getElementById('forwardExecutionMode').value = data.settings.forward_execution_mode === 'parallel' ? 'parallel' : 'serial';
+                    document.getElementById('forwardParallelWorkers').value = data.settings.forward_parallel_workers || '4';
                     document.getElementById('forwardAccountDelaySeconds').value = data.settings.forward_account_delay_seconds || '0';
                     document.getElementById('forwardEmailWindowMinutes').value = data.settings.forward_email_window_minutes || '0';
                     document.getElementById('forwardIncludeJunkemail').checked = String(data.settings.forward_include_junkemail) === 'true';
@@ -1021,6 +1816,7 @@
                     document.getElementById('settingsSmtpUseSsl').checked = String(data.settings.smtp_use_ssl) !== 'false';
                     document.getElementById('settingsTelegramBotToken').value = data.settings.telegram_bot_token || '';
                     document.getElementById('settingsTelegramChatId').value = data.settings.telegram_chat_id || '';
+                    document.getElementById('settingsTelegramTopicId').value = data.settings.telegram_topic_id || '';
                     document.getElementById('settingsTelegramProxyUrl').value = data.settings.telegram_proxy_url || '';
                     document.getElementById('settingsWecomWebhookUrl').value = data.settings.wecom_webhook_url || '';
                     document.getElementById('webdavBackupEnabled').checked = String(data.settings.webdav_backup_enabled) === 'true';
@@ -1037,6 +1833,8 @@
                     document.querySelector('input[name="refreshStrategy"][value="' + (useCron ? 'cron' : 'days') + '"]').checked = true;
                     toggleRefreshStrategy();
                     syncSmtpProviderUI(false);
+                    syncForwardExecutionModeUI();
+                    await loadCloudflareChannelsForSettings();
                     await loadNormalMailRetentionStatus();
                 }
             } catch (error) {
@@ -1047,6 +1845,7 @@
         async function saveSettings() {
             ensureForwardingSettingsUI();
             const password = document.getElementById('settingsPassword').value;
+            const currentPassword = document.getElementById('settingsCurrentPassword')?.value || '';
             const apiKey = document.getElementById('settingsApiKey').value.trim();
             const externalApiKey = document.getElementById('settingsExternalApiKey').value.trim();
             const refreshDays = document.getElementById('refreshIntervalDays').value;
@@ -1063,21 +1862,42 @@
             const forwardChannels = getSelectedForwardChannels();
 
             if (password) {
+                if (!currentPassword) {
+                    showToast('修改登录密码需要输入当前密码', 'error');
+                    return;
+                }
+                if (password.length < 8) {
+                    showToast('新登录密码长度至少为 8 位', 'error');
+                    return;
+                }
                 settings.login_password = password;
+                settings.current_login_password = currentPassword;
             }
 
             settings.gptmail_api_key = apiKey;
             settings.external_api_key = externalApiKey;
             settings.duckmail_base_url = document.getElementById('settingsDuckmailBaseUrl').value.trim();
             settings.duckmail_api_key = document.getElementById('settingsDuckmailApiKey').value.trim();
-            settings.cloudflare_worker_domain = document.getElementById('settingsCloudflareWorkerDomain').value.trim();
-            settings.cloudflare_email_domains = document.getElementById('settingsCloudflareEmailDomains').value.trim();
-            settings.cloudflare_admin_password = document.getElementById('settingsCloudflareAdminPassword').value.trim();
+            settings.cloudflare_ai_username_enabled = !!document.getElementById('settingsCloudflareAiEnabled')?.checked;
+            settings.cloudflare_ai_username_api_url = document.getElementById('settingsCloudflareAiApiUrl')?.value.trim() || '';
+            settings.cloudflare_ai_username_model = document.getElementById('settingsCloudflareAiModel')?.value.trim() || '';
+            settings.cloudflare_ai_username_prompt = document.getElementById('settingsCloudflareAiPrompt')?.value.trim() || '';
+            const cloudflareAiApiKey = document.getElementById('settingsCloudflareAiApiKey')?.value.trim() || '';
+            if (cloudflareAiApiKey) {
+                settings.cloudflare_ai_username_api_key = cloudflareAiApiKey;
+            }
+            if (document.getElementById('settingsCloudflareAiClearApiKey')?.checked) {
+                settings.cloudflare_ai_username_clear_api_key = true;
+            }
 
             const days = parseInt(refreshDays, 10);
             const delay = parseInt(refreshDelay, 10);
-            const forwardMinutes = parseInt(document.getElementById('forwardCheckIntervalMinutes').value || '5', 10);
-            const forwardAccountDelaySeconds = parseInt(document.getElementById('forwardAccountDelaySeconds').value || '0', 10);
+            const forwardSeconds = parseInt(document.getElementById('forwardCheckIntervalSeconds').value || '300', 10);
+            const forwardExecutionMode = document.getElementById('forwardExecutionMode')?.value === 'parallel' ? 'parallel' : 'serial';
+            const forwardParallelWorkers = parseInt(document.getElementById('forwardParallelWorkers').value || '4', 10);
+            const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel'
+                ? 0
+                : parseInt(document.getElementById('forwardAccountDelaySeconds').value || '0', 10);
             const forwardWindowMinutes = parseInt(document.getElementById('forwardEmailWindowMinutes').value || '0', 10);
             const forwardIncludeJunkemail = !!document.getElementById('forwardIncludeJunkemail')?.checked;
             const smtpPortValue = document.getElementById('settingsSmtpPort').value.trim();
@@ -1089,6 +1909,7 @@
             const smtpUsername = document.getElementById('settingsSmtpUsername').value.trim();
             const telegramBotToken = document.getElementById('settingsTelegramBotToken').value.trim();
             const telegramChatId = document.getElementById('settingsTelegramChatId').value.trim();
+            const telegramTopicId = document.getElementById('settingsTelegramTopicId').value.trim();
             const telegramProxyUrl = document.getElementById('settingsTelegramProxyUrl').value.trim();
             const wecomWebhookUrl = document.getElementById('settingsWecomWebhookUrl').value.trim();
             const webdavBackupSettings = getWebdavBackupFormSettings();
@@ -1107,8 +1928,16 @@
                 showToast('Invalid time zone', 'error');
                 return;
             }
-            if (Number.isNaN(forwardMinutes) || forwardMinutes < 1 || forwardMinutes > 60) {
-                showToast('转发轮询间隔必须在 1-60 分钟之间', 'error');
+            if (Number.isNaN(forwardSeconds) || forwardSeconds < 20 || forwardSeconds > 3600) {
+                showToast('转发轮询间隔必须在 20-3600 秒之间', 'error');
+                return;
+            }
+            if (!['serial', 'parallel'].includes(forwardExecutionMode)) {
+                showToast('转发执行模式无效', 'error');
+                return;
+            }
+            if (Number.isNaN(forwardParallelWorkers) || forwardParallelWorkers < 1 || forwardParallelWorkers > 10) {
+                showToast('转发并行 worker 数必须在 1-10 之间', 'error');
                 return;
             }
             if (Number.isNaN(forwardAccountDelaySeconds) || forwardAccountDelaySeconds < 0 || forwardAccountDelaySeconds > 60) {
@@ -1141,6 +1970,10 @@
             }
             if (forwardChannels.includes('telegram') && !telegramChatId) {
                 showToast('启用 TG 转发时必须填写 Telegram Chat ID', 'error');
+                return;
+            }
+            if (telegramTopicId && !/^\d+$/.test(telegramTopicId)) {
+                showToast('Telegram Topic ID 必须是纯数字', 'error');
                 return;
             }
             if (forwardChannels.includes('wecom') && !wecomWebhookUrl) {
@@ -1184,7 +2017,10 @@
             settings.show_group_id = showGroupId;
             settings.normal_mail_local_retention_enabled = normalMailLocalRetentionEnabled;
             settings.forward_channels = forwardChannels;
-            settings.forward_check_interval_minutes = forwardMinutes;
+            settings.forward_check_interval_seconds = forwardSeconds;
+            settings.forward_check_interval_minutes = Math.max(1, Math.min(60, Math.ceil(forwardSeconds / 60)));
+            settings.forward_execution_mode = forwardExecutionMode;
+            settings.forward_parallel_workers = forwardParallelWorkers;
             settings.forward_account_delay_seconds = forwardAccountDelaySeconds;
             settings.forward_email_window_minutes = forwardWindowMinutes;
             settings.forward_include_junkemail = forwardIncludeJunkemail;
@@ -1199,6 +2035,7 @@
             settings.smtp_use_ssl = document.getElementById('settingsSmtpUseSsl').checked;
             settings.telegram_bot_token = telegramBotToken;
             settings.telegram_chat_id = telegramChatId;
+            settings.telegram_topic_id = telegramTopicId;
             settings.telegram_proxy_url = telegramProxyUrl;
             settings.wecom_webhook_url = wecomWebhookUrl;
 
@@ -1290,7 +2127,15 @@
                 return;
             }
 
-            showToast('时间展示已生效，定时任务重启后生效', 'success');
+            document.getElementById('settingsPassword').value = '';
+            const currentPasswordInput = document.getElementById('settingsCurrentPassword');
+            if (currentPasswordInput) currentPasswordInput.value = '';
+
+            if (password) {
+                showToast('登录密码已更新，其他已登录设备需要重新登录', 'success');
+            } else {
+                showToast('时间展示已生效，定时任务重启后生效', 'success');
+            }
             hideSettingsModal();
         }
 
@@ -1312,6 +2157,7 @@
                 telegram: {
                     bot_token: document.getElementById('settingsTelegramBotToken').value.trim(),
                     chat_id: document.getElementById('settingsTelegramChatId').value.trim(),
+                    topic_id: document.getElementById('settingsTelegramTopicId').value.trim(),
                     proxy_url: document.getElementById('settingsTelegramProxyUrl').value.trim(),
                 },
                 wecom: {
@@ -1353,6 +2199,10 @@
                 }
                 if (!draft.telegram.chat_id) {
                     showToast('请先填写 Telegram Chat ID', 'error');
+                    return;
+                }
+                if (draft.telegram.topic_id && !/^\d+$/.test(draft.telegram.topic_id)) {
+                    showToast('Telegram Topic ID 必须是纯数字', 'error');
                     return;
                 }
             } else if (channel === 'wecom') {

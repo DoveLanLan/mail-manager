@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     # These segmented files are executed into the shared `web_outlook_app`
@@ -15,6 +15,105 @@ if TYPE_CHECKING:
 
 
 # ==================== OAuth Token API ====================
+
+def extract_oauth_authorization_code(redirected_url: str) -> tuple[bool, str, str]:
+    """从 OAuth 回调 URL 提取授权码。"""
+    import urllib.parse
+
+    normalized_url = str(redirected_url or '').strip()
+    if not normalized_url:
+        return False, '', '请提供授权后的完整 URL'
+
+    try:
+        parsed_url = urllib.parse.urlparse(normalized_url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        auth_code = str(query_params['code'][0] or '').strip()
+    except (KeyError, IndexError):
+        return False, '', '无法从 URL 中提取授权码，请检查 URL 是否正确'
+
+    if not auth_code:
+        return False, '', '无法从 URL 中提取授权码，请检查 URL 是否正确'
+    return True, auth_code, ''
+
+
+def exchange_oauth_code_for_tokens(redirected_url: str) -> Dict[str, Any]:
+    """使用授权后的回调 URL 换取 Microsoft OAuth token。"""
+    success, auth_code, error_message = extract_oauth_authorization_code(redirected_url)
+    if not success:
+        return {'success': False, 'error': error_message}
+
+    token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    token_data = {
+        "client_id": OAUTH_CLIENT_ID,
+        "code": auth_code,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "grant_type": "authorization_code",
+        "scope": " ".join(OAUTH_SCOPES)
+    }
+
+    try:
+        response = requests.post(token_url, data=token_data, timeout=30)
+    except Exception as e:
+        return {'success': False, 'error': f'请求失败: {sanitize_error_details(str(e))}'}
+
+    if response.status_code != 200:
+        try:
+            error_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
+        except Exception:
+            error_data = {}
+        error_msg = error_data.get('error_description', response.text)
+        return {'success': False, 'error': f'获取令牌失败: {sanitize_error_details(error_msg)}'}
+
+    tokens = response.json()
+    refresh_token = str(tokens.get('refresh_token') or '').strip()
+    if not refresh_token:
+        return {'success': False, 'error': '未能获取 Refresh Token'}
+
+    return {
+        'success': True,
+        'refresh_token': refresh_token,
+        'client_id': OAUTH_CLIENT_ID,
+        'token_type': tokens.get('token_type'),
+        'expires_in': tokens.get('expires_in'),
+        'scope': tokens.get('scope')
+    }
+
+
+def update_account_authorization_for_reauth(account_id: int, client_id: str, refresh_token: str, db_conn=None) -> bool:
+    """只更新已有 Outlook 账号的授权字段，并清理旧刷新失败状态。"""
+    token_value = str(refresh_token or '').strip()
+    client_id_value = str(client_id or '').strip()
+    if not token_value or not client_id_value:
+        return False
+
+    db = db_conn or get_db()
+    should_commit = db_conn is None
+    try:
+        db.execute(
+            '''
+            UPDATE accounts
+            SET client_id = ?,
+                refresh_token = ?,
+                refresh_token_updated_at = CURRENT_TIMESTAMP,
+                last_refresh_status = 'never',
+                last_refresh_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            ''',
+            (client_id_value, encrypt_data(token_value), account_id)
+        )
+        if should_commit:
+            db.commit()
+        return True
+    except Exception as e:
+        if should_commit:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        print(f"更新账号重新授权信息失败: {sanitize_error_details(str(e))}")
+        return False
+
 
 @app.route('/api/oauth/auth-url', methods=['GET'])
 @login_required
@@ -45,56 +144,119 @@ def api_get_oauth_auth_url():
 @login_required
 def api_exchange_oauth_token():
     """使用授权码换取 Refresh Token"""
-    import urllib.parse
+    data = request.get_json(silent=True) or {}
+    token_result = exchange_oauth_code_for_tokens(data.get('redirected_url', ''))
+    return jsonify(token_result)
 
-    data = request.json
-    redirected_url = data.get('redirected_url', '').strip()
 
-    if not redirected_url:
-        return jsonify({'success': False, 'error': '请提供授权后的完整 URL'})
+@app.route('/api/accounts/<int:account_id>/reauthorize', methods=['POST'])
+@login_required
+def api_reauthorize_account(account_id):
+    """为已有 Outlook 账号重新授权，并立即执行一次刷新验证。"""
+    db = get_db()
+    account = db.execute(
+        '''
+        SELECT id, email, client_id, refresh_token, group_id, account_type, provider,
+               proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        FROM accounts
+        WHERE id = ?
+        ''',
+        (account_id,)
+    ).fetchone()
 
-    # 从 URL 中提取 code
-    try:
-        parsed_url = urllib.parse.urlparse(redirected_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
-        auth_code = query_params['code'][0]
-    except (KeyError, IndexError):
-        return jsonify({'success': False, 'error': '无法从 URL 中提取授权码，请检查 URL 是否正确'})
+    if not account:
+        return jsonify({
+            'success': False,
+            'error': build_error_payload(
+                "ACCOUNT_NOT_FOUND",
+                "账号不存在",
+                "NotFoundError",
+                404,
+                f"account_id={account_id}"
+            )
+        }), 404
 
-    # 使用 Code 换取 Token (Public Client 不需要 client_secret)
-    token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-    token_data = {
-        "client_id": OAUTH_CLIENT_ID,
-        "code": auth_code,
-        "redirect_uri": OAUTH_REDIRECT_URI,
-        "grant_type": "authorization_code",
-        "scope": " ".join(OAUTH_SCOPES)
-    }
+    if (account['account_type'] or 'outlook').strip().lower() == 'imap':
+        return jsonify({
+            'success': False,
+            'error': build_error_payload(
+                "ACCOUNT_REAUTH_UNSUPPORTED",
+                "IMAP 账号不支持重新授权",
+                "UnsupportedAccountTypeError",
+                400,
+                f"account_id={account_id}"
+            )
+        }), 400
 
-    try:
-        response = requests.post(token_url, data=token_data, timeout=30)
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'请求失败: {str(e)}'})
+    data = request.get_json(silent=True) or {}
+    token_result = exchange_oauth_code_for_tokens(data.get('redirected_url', ''))
+    if not token_result.get('success'):
+        return jsonify({
+            'success': False,
+            'error': build_error_payload(
+                "OAUTH_EXCHANGE_FAILED",
+                "重新授权失败",
+                "OAuthExchangeError",
+                400,
+                token_result.get('error') or '未知错误'
+            )
+        }), 400
 
-    if response.status_code == 200:
-        tokens = response.json()
-        refresh_token = tokens.get('refresh_token')
+    if not update_account_authorization_for_reauth(
+        account_id,
+        token_result.get('client_id', ''),
+        token_result.get('refresh_token', ''),
+        db
+    ):
+        db.rollback()
+        return jsonify({
+            'success': False,
+            'error': build_error_payload(
+                "ACCOUNT_REAUTH_SAVE_FAILED",
+                "保存重新授权信息失败",
+                "DatabaseError",
+                500,
+                f"account_id={account_id}"
+            )
+        }), 500
 
-        if not refresh_token:
-            return jsonify({'success': False, 'error': '未能获取 Refresh Token'})
+    db.commit()
 
+    refreshed_account = db.execute(
+        '''
+        SELECT id, email, client_id, refresh_token, group_id, account_type, provider,
+               proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        FROM accounts
+        WHERE id = ?
+        ''',
+        (account_id,)
+    ).fetchone()
+    validation_result = refresh_outlook_account_token(refreshed_account, 'reauthorize', db_conn=db)
+    db.commit()
+
+    if validation_result.get('success'):
         return jsonify({
             'success': True,
-            'refresh_token': refresh_token,
-            'client_id': OAUTH_CLIENT_ID,
-            'token_type': tokens.get('token_type'),
-            'expires_in': tokens.get('expires_in'),
-            'scope': tokens.get('scope')
+            'message': '重新授权成功，Token 刷新验证通过',
+            'authorization_updated': True,
+            'validation': {
+                'success': True,
+                'status': 'success',
+                'message': validation_result.get('message') or 'Token 刷新成功'
+            }
         })
-    else:
-        error_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
-        error_msg = error_data.get('error_description', response.text)
-        return jsonify({'success': False, 'error': f'获取令牌失败: {error_msg}'})
+
+    return jsonify({
+        'success': True,
+        'message': '重新授权已保存，但自动刷新验证失败',
+        'authorization_updated': True,
+        'validation': {
+            'success': False,
+            'status': 'failed',
+            'error': validation_result.get('error_payload'),
+            'error_message': validation_result.get('error_message') or '未知错误'
+        }
+    })
 
 
 # ==================== 设置 API ====================
@@ -433,6 +595,17 @@ def api_get_settings():
     settings['cloudflare_worker_domain'] = get_cloudflare_worker_domain()
     settings['cloudflare_email_domains'] = ', '.join(get_cloudflare_email_domains())
     settings['cloudflare_admin_password'] = get_cloudflare_admin_password()
+    settings.pop('cloudflare_ai_username_api_key', None)
+    cloudflare_ai_api_key = get_setting_decrypted('cloudflare_ai_username_api_key', '')
+    settings['cloudflare_ai_username_enabled'] = get_setting('cloudflare_ai_username_enabled', 'false')
+    settings['cloudflare_ai_username_api_url'] = get_setting('cloudflare_ai_username_api_url', '')
+    settings['cloudflare_ai_username_model'] = get_setting('cloudflare_ai_username_model', '')
+    settings['cloudflare_ai_username_prompt'] = get_setting(
+        'cloudflare_ai_username_prompt',
+        CLOUDFLARE_AI_USERNAME_DEFAULT_PROMPT,
+    )
+    settings['cloudflare_ai_username_api_key_configured'] = bool(cloudflare_ai_api_key)
+    settings['cloudflare_ai_username_api_key_masked'] = '********' if cloudflare_ai_api_key else ''
     settings['app_timezone'] = get_app_timezone()
     settings['show_account_created_at'] = get_setting('show_account_created_at', 'true')
     settings['show_account_sort_order'] = get_setting('show_account_sort_order', 'false')
@@ -441,9 +614,20 @@ def api_get_settings():
         'normal_mail_local_retention_enabled',
         'false',
     )
+    skin_settings = get_skin_settings_payload()
+    settings['active_skin_id'] = skin_settings['active_skin_id']
+    settings['configured_skin_id'] = skin_settings['configured_skin_id']
+    settings['active_skin'] = skin_settings['active_skin']
+    settings['active_skin_asset_hash'] = skin_settings['asset_hash']
     settings['forward_channels'] = get_forward_channels()
     settings['forward_check_interval_minutes'] = get_setting('forward_check_interval_minutes', '5')
-    settings['forward_account_delay_seconds'] = get_setting('forward_account_delay_seconds', '0')
+    settings['forward_check_interval_seconds'] = str(normalize_forward_check_interval_seconds())
+    forward_execution_mode = normalize_forward_execution_mode()
+    settings['forward_execution_mode'] = forward_execution_mode
+    settings['forward_parallel_workers'] = str(normalize_forward_parallel_workers())
+    settings['forward_account_delay_seconds'] = (
+        '0' if forward_execution_mode == 'parallel' else get_setting('forward_account_delay_seconds', '0')
+    )
     settings['forward_email_window_minutes'] = get_setting('forward_email_window_minutes', '0')
     settings['forward_include_junkemail'] = get_setting('forward_include_junkemail', 'false')
     settings['email_forward_recipient'] = get_setting('email_forward_recipient', '')
@@ -457,6 +641,7 @@ def api_get_settings():
     settings['smtp_use_ssl'] = get_setting('smtp_use_ssl', 'true')
     settings['telegram_bot_token'] = get_setting_decrypted('telegram_bot_token', '')
     settings['telegram_chat_id'] = get_setting('telegram_chat_id', '')
+    settings['telegram_topic_id'] = get_setting('telegram_topic_id', '')
     settings['telegram_proxy_url'] = get_setting('telegram_proxy_url', '')
     settings['wecom_webhook_url'] = get_setting_decrypted('wecom_webhook_url', '')
     settings['webdav_backup_enabled'] = get_setting('webdav_backup_enabled', 'false')
@@ -520,19 +705,26 @@ def api_update_settings():
             if cron_error:
                 return jsonify({'success': False, 'error': cron_error})
 
-    # 更新登录密码
+    # 更新登录密码：必须验证当前密码；成功后轮换会话版本，使其他已登录会话失效
     if 'login_password' in data:
-        new_password = data['login_password'].strip()
+        new_password = str(data.get('login_password') or '').strip()
         if new_password:
             if len(new_password) < 8:
-                errors.append('密码长度至少为 8 位')
-            else:
-                # 哈希新密码
-                hashed_password = hash_password(new_password)
-                if set_setting('login_password', hashed_password):
-                    updated.append('登录密码')
-                else:
-                    errors.append('更新登录密码失败')
+                return jsonify({'success': False, 'error': '密码长度至少为 8 位'})
+            current_password = str(data.get('current_login_password') or '')
+            if not current_password:
+                return jsonify({'success': False, 'error': '修改登录密码需要验证当前密码'})
+            if not verify_login_password(current_password):
+                return jsonify({'success': False, 'error': '当前登录密码错误'})
+            hashed_password = hash_password(new_password)
+            if not set_setting('login_password', hashed_password):
+                return jsonify({'success': False, 'error': '更新登录密码失败'})
+            new_session_version = rotate_login_session_version()
+            # 当前改密会话继续有效，其余旧会话在下次请求时失效
+            session['logged_in'] = True
+            session.permanent = True
+            bind_login_session_version(new_session_version)
+            updated.append('登录密码')
 
     # 更新 GPTMail API Key
     if 'gptmail_api_key' in data:
@@ -662,6 +854,13 @@ def api_update_settings():
         else:
             errors.append('普通邮箱本地保留开关必须是 true 或 false')
 
+    if 'active_skin_id' in data:
+        success, error, _skin = set_active_skin(data.get('active_skin_id'))
+        if success:
+            updated.append('当前皮肤')
+        else:
+            errors.append(error or '保存当前皮肤失败')
+
     # 更新对外 API Key
     if 'external_api_key' in data:
         new_ext_key = data['external_api_key'].strip()
@@ -710,6 +909,48 @@ def api_update_settings():
         else:
             errors.append('更新 Cloudflare 管理密码失败')
 
+    if 'cloudflare_ai_username_enabled' in data:
+        enabled = normalize_bool_setting_value(data['cloudflare_ai_username_enabled'])
+        if set_setting('cloudflare_ai_username_enabled', enabled):
+            updated.append('Cloudflare AI 用户名开关')
+        else:
+            errors.append('保存 Cloudflare AI 用户名开关失败')
+
+    if 'cloudflare_ai_username_api_url' in data:
+        if set_setting('cloudflare_ai_username_api_url', str(data['cloudflare_ai_username_api_url']).strip()):
+            updated.append('Cloudflare AI API 地址')
+        else:
+            errors.append('保存 Cloudflare AI API 地址失败')
+
+    if 'cloudflare_ai_username_model' in data:
+        if set_setting('cloudflare_ai_username_model', str(data['cloudflare_ai_username_model']).strip()):
+            updated.append('Cloudflare AI 模型')
+        else:
+            errors.append('保存 Cloudflare AI 模型失败')
+
+    if 'cloudflare_ai_username_prompt' in data:
+        prompt = str(data['cloudflare_ai_username_prompt'] or '').strip() or CLOUDFLARE_AI_USERNAME_DEFAULT_PROMPT
+        if set_setting('cloudflare_ai_username_prompt', prompt):
+            updated.append('Cloudflare AI 提示词')
+        else:
+            errors.append('保存 Cloudflare AI 提示词失败')
+
+    if data.get('cloudflare_ai_username_clear_api_key'):
+        if set_setting_encrypted('cloudflare_ai_username_api_key', ''):
+            updated.append('Cloudflare AI API Key（已清空）')
+        else:
+            errors.append('清空 Cloudflare AI API Key 失败')
+    elif 'cloudflare_ai_username_api_key' in data:
+        ai_api_key = str(data['cloudflare_ai_username_api_key'] or '').strip()
+        if ai_api_key:
+            if set_setting_encrypted('cloudflare_ai_username_api_key', ai_api_key):
+                updated.append('Cloudflare AI API Key')
+            else:
+                errors.append('保存 Cloudflare AI API Key 失败')
+
+    forward_execution_mode_for_delay = normalize_forward_execution_mode()
+    forward_account_delay_updated = False
+
     if 'forward_check_interval_minutes' in data:
         try:
             minutes = int(data['forward_check_interval_minutes'])
@@ -717,22 +958,70 @@ def api_update_settings():
                 errors.append('转发检查间隔必须在 1-60 分钟之间')
             elif set_setting('forward_check_interval_minutes', str(minutes)):
                 updated.append('转发检查间隔')
+                if 'forward_check_interval_seconds' not in data:
+                    if not set_setting('forward_check_interval_seconds', str(minutes * 60)):
+                        errors.append('保存转发秒级轮询间隔失败')
             else:
                 errors.append('保存转发检查间隔失败')
         except ValueError:
             errors.append('转发检查间隔必须是数字')
 
+    if 'forward_check_interval_seconds' in data:
+        try:
+            seconds = parse_forward_check_interval_seconds_input(data['forward_check_interval_seconds'])
+            if set_setting('forward_check_interval_seconds', str(seconds)):
+                updated.append('转发秒级轮询间隔')
+            else:
+                errors.append('保存转发秒级轮询间隔失败')
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if 'forward_execution_mode' in data:
+        try:
+            execution_mode = parse_forward_execution_mode_input(data['forward_execution_mode'])
+            if set_setting('forward_execution_mode', execution_mode):
+                updated.append('转发执行模式')
+                forward_execution_mode_for_delay = execution_mode
+            else:
+                errors.append('保存转发执行模式失败')
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if 'forward_parallel_workers' in data:
+        try:
+            workers = parse_forward_parallel_workers_input(data['forward_parallel_workers'])
+            if set_setting('forward_parallel_workers', str(workers)):
+                updated.append('转发并行 worker 数')
+            else:
+                errors.append('保存转发并行 worker 数失败')
+        except ValueError as exc:
+            errors.append(str(exc))
+
     if 'forward_account_delay_seconds' in data:
         try:
-            seconds = int(data['forward_account_delay_seconds'])
+            seconds = (
+                0 if forward_execution_mode_for_delay == 'parallel'
+                else int(data['forward_account_delay_seconds'])
+            )
             if seconds < 0 or seconds > 60:
                 errors.append('账号间拉取间隔必须在 0-60 秒之间')
             elif set_setting('forward_account_delay_seconds', str(seconds)):
                 updated.append('账号间拉取间隔')
+                forward_account_delay_updated = True
             else:
                 errors.append('保存账号间拉取间隔失败')
-        except ValueError:
+        except (TypeError, ValueError):
             errors.append('账号间拉取间隔必须是数字')
+
+    if (
+        'forward_execution_mode' in data
+        and forward_execution_mode_for_delay == 'parallel'
+        and not forward_account_delay_updated
+    ):
+        if set_setting('forward_account_delay_seconds', '0'):
+            updated.append('账号间拉取间隔')
+        else:
+            errors.append('保存账号间拉取间隔失败')
 
     if 'forward_email_window_minutes' in data:
         try:
@@ -839,6 +1128,12 @@ def api_update_settings():
         else:
             errors.append('保存 Telegram Chat ID 失败')
 
+    if 'telegram_topic_id' in data:
+        if set_setting('telegram_topic_id', data['telegram_topic_id'].strip()):
+            updated.append('Telegram Topic ID')
+        else:
+            errors.append('保存 Telegram Topic ID 失败')
+
     if 'telegram_proxy_url' in data:
         if set_setting('telegram_proxy_url', data['telegram_proxy_url'].strip()):
             updated.append('Telegram 代理')
@@ -894,6 +1189,97 @@ def api_update_settings():
         return jsonify({'success': True, 'message': f'已更新：{", ".join(updated)}'})
     else:
         return jsonify({'success': False, 'error': '没有需要更新的设置'})
+
+
+# ==================== 皮肤管理 API ====================
+
+@app.route('/api/skins', methods=['GET'])
+@login_required
+def api_list_skins():
+    return jsonify({
+        'success': True,
+        **get_skin_settings_payload(),
+    })
+
+
+@app.route('/api/skins/<skin_id>/activate', methods=['POST'])
+@login_required
+def api_activate_skin(skin_id):
+    success, error, skin = set_active_skin(skin_id)
+    if not success:
+        return jsonify({'success': False, 'error': error or '启用皮肤失败'})
+    return jsonify({
+        'success': True,
+        'message': '皮肤已启用',
+        'active_skin': skin,
+        'asset_hash': get_active_skin_asset_hash(),
+    })
+
+
+@app.route('/api/skins/upload', methods=['POST'])
+@login_required
+def api_upload_skin():
+    uploaded_file = request.files.get('skin') or request.files.get('file')
+    try:
+        skin = install_uploaded_skin_file(uploaded_file)
+    except SkinValidationError as exc:
+        return jsonify({'success': False, 'error': str(exc)})
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'安装上传皮肤失败: {sanitize_error_details(str(exc))}'})
+
+    return jsonify({
+        'success': True,
+        'message': '皮肤已安装',
+        'skin': skin,
+    })
+
+
+@app.route('/api/skins/git/install', methods=['POST'])
+@login_required
+def api_install_git_skin():
+    data = request.get_json(silent=True) or {}
+    try:
+        skin = install_git_skin_package(data.get('git_url'), data.get('git_ref', ''))
+    except SkinValidationError as exc:
+        return jsonify({'success': False, 'error': str(exc)})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': '拉取 Git 皮肤超时'})
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'安装 Git 皮肤失败: {sanitize_error_details(str(exc))}'})
+
+    return jsonify({
+        'success': True,
+        'message': 'Git 皮肤已安装',
+        'skin': skin,
+    })
+
+
+@app.route('/api/skins/<skin_id>/git/update', methods=['POST'])
+@login_required
+def api_update_git_skin(skin_id):
+    try:
+        skin = update_git_skin_package(skin_id)
+    except SkinValidationError as exc:
+        return jsonify({'success': False, 'error': str(exc)})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': '更新 Git 皮肤超时'})
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'更新 Git 皮肤失败: {sanitize_error_details(str(exc))}'})
+
+    return jsonify({
+        'success': True,
+        'message': 'Git 皮肤已更新',
+        'skin': skin,
+    })
+
+
+@app.route('/api/skins/<skin_id>', methods=['DELETE'])
+@login_required
+def api_delete_skin(skin_id):
+    success, error = delete_custom_skin(skin_id)
+    if not success:
+        return jsonify({'success': False, 'error': error or '删除皮肤失败'})
+    return jsonify({'success': True, 'message': '皮肤已删除'})
 
 
 # ==================== 对外 API ====================
@@ -983,3 +1369,293 @@ def api_external_get_emails():
         all_errors['imap_old'] = imap_old_result.get('error')
 
     return jsonify({'success': False, 'error': '无法获取邮件，所有方式均失败', 'details': all_errors})
+
+
+@app.route('/api/external/outlook/upload', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_upload_outlook():
+    """对外 API：上传 Outlook 邮箱账号密码到上传表（默认未授权）。
+
+    支持单条 {email, password, remark?} 或批量 {accounts: [...]}。
+    """
+    data = request.get_json(silent=True) or {}
+
+    raw_accounts = data.get('accounts')
+    if isinstance(raw_accounts, list) and raw_accounts:
+        items = [
+            {
+                'email': item.get('email', ''),
+                'password': item.get('password', ''),
+                'remark': item.get('remark', ''),
+            }
+            for item in raw_accounts
+            if isinstance(item, dict)
+        ]
+    elif data.get('email'):
+        items = [{
+            'email': data.get('email', ''),
+            'password': data.get('password', ''),
+            'remark': data.get('remark', ''),
+        }]
+    else:
+        return jsonify({'success': False, 'error': '请求体需包含 email/password 或非空 accounts 数组'}), 400
+
+    summary = add_upload_accounts_bulk(items)
+    return jsonify({'success': True, **summary})
+
+
+@app.route('/api/outlook-upload-accounts', methods=['GET'])
+@login_required
+def api_list_outlook_upload_accounts():
+    """分页查询外部上传的 Outlook 账号，供前端弹框表格展示。"""
+    page = parse_non_negative_int(request.args.get('page', 1), 1) or 1
+    page_size = parse_non_negative_int(
+        request.args.get('page_size', UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE),
+        UPLOAD_ACCOUNTS_API_DEFAULT_PAGE_SIZE,
+        UPLOAD_ACCOUNTS_MAX_PAGE_SIZE,
+    )
+    keyword = str(request.args.get('keyword', '') or '').strip()
+    auth_status = str(request.args.get('auth_status', 'all') or 'all').strip().lower()
+    result = query_upload_accounts_page(
+        page=page,
+        page_size=page_size,
+        keyword=keyword,
+        auth_status=auth_status,
+    )
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/outlook-upload-accounts', methods=['POST'])
+@login_required
+def api_add_outlook_upload_account():
+    """添加单个外部上传的 Outlook 账号。"""
+    data = request.get_json(silent=True) or {}
+    email = str(data.get('email', '') or '').strip()
+    password = str(data.get('password', '') or '').strip()
+    remark = str(data.get('remark', '') or '').strip()
+    group_id = data.get('group_id')
+    proxy_url = str(data.get('proxy_url', '') or '').strip()
+    tag_ids = data.get('tag_ids')
+
+    if not email:
+        return jsonify({'success': False, 'error': '邮箱不能为空'}), 400
+    if not password:
+        return jsonify({'success': False, 'error': '密码不能为空'}), 400
+
+    result = add_upload_account(
+        email,
+        password,
+        remark,
+        group_id=group_id,
+        proxy_url=proxy_url,
+        tag_ids=tag_ids,
+    )
+    db = get_db()
+    db.commit()
+
+    if result['status'] == 'added':
+        return jsonify({'success': True, 'message': '添加成功', 'account': result})
+    elif result['status'] == 'duplicate':
+        return jsonify({'success': False, 'error': '该邮箱已存在'}), 400
+    else:
+        return jsonify({'success': False, 'error': '邮箱格式无效'}), 400
+
+
+@app.route('/api/outlook-upload-accounts/<int:account_id>', methods=['PUT'])
+@login_required
+def api_update_outlook_upload_account(account_id):
+    """更新指定 ID 的外部上传账号（邮箱 / 密码 / 备注）。
+
+    请求体字段都可选；password 留空表示保持原密码；email/remark 不传入则保持原值。
+    """
+    data = request.get_json(silent=True) or {}
+    email = data.get('email')
+    password = data.get('password')
+    remark = data.get('remark')
+
+    if email is not None:
+        email = str(email).strip()
+    if password is not None:
+        password = str(password)
+    if remark is not None:
+        remark = str(remark).strip()
+
+    result = update_upload_account(
+        account_id,
+        email=email,
+        password=password,
+        remark=remark,
+    )
+    status = result.get('status')
+    if status == 'updated':
+        db = get_db()
+        db.commit()
+        return jsonify({'success': True, 'message': '修改成功', 'account': result})
+    if status == 'not_found':
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+    if status == 'duplicate':
+        return jsonify({'success': False, 'error': '该邮箱已存在'}), 400
+    if status == 'invalid':
+        return jsonify({'success': False, 'error': '邮箱格式无效'}), 400
+    return jsonify({'success': False, 'error': '修改失败'}), 400
+
+
+@app.route('/api/outlook-upload-accounts/<int:account_id>', methods=['DELETE'])
+@login_required
+def api_delete_outlook_upload_account(account_id):
+    """删除指定 ID 的外部上传账号。"""
+    success = delete_upload_account(account_id)
+    if success:
+        db = get_db()
+        db.commit()
+        return jsonify({'success': True, 'message': '删除成功'})
+    else:
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+
+
+@app.route('/api/outlook-upload-accounts/batch-delete', methods=['POST'])
+@login_required
+def api_batch_delete_outlook_upload_accounts():
+    """批量删除 Outlook 上传账号。"""
+    data = request.get_json(silent=True) or {}
+    account_ids = normalize_account_ids(data.get('account_ids') or [])
+    if not account_ids:
+        return jsonify({'success': False, 'error': '请选择要删除的账号'}), 400
+
+    summary = delete_upload_accounts_bulk(account_ids)
+    get_db().commit()
+    return jsonify({
+        'success': True,
+        'message': f"已删除 {summary['deleted']} 个账号",
+        **summary,
+    })
+
+
+def _queue_formal_account_for_auto_auth(account_id: int) -> Dict[str, Any]:
+    """将单个正式账号加入自动授权队列；返回结果字典（含 success）。"""
+    account = get_account_by_id(account_id)
+    if not account:
+        return {
+            'success': False,
+            'account_id': account_id,
+            'error': '账号不存在',
+            'error_code': 'ACCOUNT_NOT_FOUND',
+        }
+
+    account_type = str(account.get('account_type') or 'outlook').lower()
+    if account_type == 'imap':
+        return {
+            'success': False,
+            'account_id': account_id,
+            'email': str(account.get('email') or ''),
+            'error': 'IMAP 账号不支持加入 Outlook 自动化授权',
+            'error_code': 'ACCOUNT_AUTO_AUTH_UNSUPPORTED',
+        }
+
+    email = str(account.get('email') or '').strip()
+    password = str(account.get('password') or '').strip()
+    if not email or not password:
+        return {
+            'success': False,
+            'account_id': account_id,
+            'email': email,
+            'error': '账号密码为空或无法解密，请先在编辑中设置密码',
+            'error_code': 'ACCOUNT_PASSWORD_MISSING',
+        }
+
+    remark = str(account.get('remark') or '').strip()
+    group_id = account.get('group_id') or DEFAULT_GROUP_ID
+    proxy_url = str(account.get('proxy_url') or '').strip()
+    tag_ids = [tag.get('id') for tag in get_account_tags(account_id)]
+    result = upsert_upload_account_for_auto_auth(
+        email,
+        password,
+        remark,
+        group_id=group_id,
+        proxy_url=proxy_url,
+        tag_ids=tag_ids,
+    )
+    if result['status'] == 'invalid':
+        return {
+            'success': False,
+            'account_id': account_id,
+            'email': email,
+            'error': '邮箱或密码无效，无法加入自动授权',
+            'error_code': 'ACCOUNT_AUTO_AUTH_INVALID',
+        }
+
+    return {
+        'success': True,
+        'account_id': account_id,
+        'upload_account_id': result['id'],
+        'email': result['email'],
+        'status': result['status'],
+    }
+
+
+@app.route('/api/accounts/<int:account_id>/outlook-auto-auth', methods=['POST'])
+@login_required
+def api_queue_account_for_outlook_auto_auth(account_id):
+    """将已有 Outlook 正式账号加入 Outlook 自动化授权队列。
+
+    从服务端读取正式账号邮箱和密码，调用显式重新入队 helper 写入
+    outlook_upload_accounts。不返回密码。
+    """
+    result = _queue_formal_account_for_auto_auth(account_id)
+    if not result.get('success'):
+        error_code = result.get('error_code') or 'ACCOUNT_AUTO_AUTH_FAILED'
+        status_code = 404 if error_code == 'ACCOUNT_NOT_FOUND' else 400
+        return jsonify({
+            'success': False,
+            'error': build_error_payload(
+                error_code,
+                result.get('error') or '加入自动授权失败',
+                'NotFoundError' if status_code == 404 else 'ValidationError',
+                status_code,
+                f"account_id={account_id}",
+            ),
+        }), status_code
+
+    get_db().commit()
+    return jsonify({
+        'success': True,
+        'message': '已加入自动授权' if result['status'] == 'added' else '已重新加入自动授权',
+        'upload_account_id': result['upload_account_id'],
+        'email': result['email'],
+        'status': result['status'],
+    })
+
+
+@app.route('/api/accounts/batch-outlook-auto-auth', methods=['POST'])
+@login_required
+def api_batch_queue_accounts_for_outlook_auto_auth():
+    """批量将正式 Outlook 账号加入自动化授权队列。"""
+    data = request.get_json(silent=True) or {}
+    account_ids = normalize_account_ids(data.get('account_ids') or [])
+    if not account_ids:
+        return jsonify({'success': False, 'error': '请选择要加入自动授权的账号'}), 400
+
+    results: List[Dict[str, Any]] = []
+    added = updated = failed = 0
+    for account_id in account_ids:
+        outcome = _queue_formal_account_for_auto_auth(account_id)
+        results.append(outcome)
+        if not outcome.get('success'):
+            failed += 1
+            continue
+        if outcome.get('status') == 'updated':
+            updated += 1
+        else:
+            added += 1
+
+    get_db().commit()
+    return jsonify({
+        'success': True,
+        'message': f'已处理 {len(account_ids)} 个账号：新增 {added}，重新入队 {updated}，失败 {failed}',
+        'total': len(account_ids),
+        'added': added,
+        'updated': updated,
+        'failed': failed,
+        'results': results,
+    })

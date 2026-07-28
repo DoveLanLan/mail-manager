@@ -28,11 +28,14 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.app.config['TESTING'] = True
         self.app.config['WTF_CSRF_ENABLED'] = False
         self.client = self.app.test_client()
-        with self.client.session_transaction() as sess:
-            sess['logged_in'] = True
 
         with self.app.app_context():
             web_outlook_app.init_db()
+            # 避免其他用例改密后的会话版本污染本用例的假登录态
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
             db = web_outlook_app.get_db()
             db.execute('DELETE FROM project_account_events')
             db.execute('DELETE FROM project_accounts')
@@ -47,6 +50,10 @@ class ProjectRuntimeTests(unittest.TestCase):
             db.execute('DELETE FROM accounts')
             db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
             db.commit()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
 
     def _create_group(self, name: str) -> int:
         with self.app.app_context():
@@ -132,6 +139,128 @@ class ProjectRuntimeTests(unittest.TestCase):
         payload = response.get_json()
         self.assertTrue(payload['success'])
         return payload['data']['accounts']
+
+    def test_account_detail_returns_saved_password_fields(self):
+        account_id = self._insert_account('hidden-secret@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET password = ?, imap_password = ?
+                WHERE id = ?
+                ''',
+                ('saved-password', 'saved-imap-password', account_id)
+            )
+            db.commit()
+
+        response = self.client.get(f'/api/accounts/{account_id}')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        account = payload['account']
+        self.assertEqual(account['password'], 'saved-password')
+        self.assertEqual(account['imap_password'], 'saved-imap-password')
+        self.assertTrue(account['has_password'])
+        self.assertTrue(account['has_imap_password'])
+
+    def test_account_detail_logs_audit_on_view(self):
+        account_id = self._insert_account('audit-detail@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                "UPDATE accounts SET password = ? WHERE id = ?",
+                ('secret-pw', account_id)
+            )
+            db.commit()
+
+        response = self.client.get(f'/api/accounts/{account_id}')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            logs = db.execute(
+                "SELECT * FROM audit_logs WHERE resource_type = 'account' AND resource_id = ? ORDER BY id DESC LIMIT 1",
+                (str(account_id),)
+            ).fetchone()
+        self.assertIsNotNone(logs)
+        self.assertEqual(logs['action'], 'view_account_detail')
+        self.assertIn('audit-detail@example.com', logs['details'])
+
+    def test_account_secrets_endpoint_removed(self):
+        account_id = self._insert_account('removed-secrets@example.com')
+        response = self.client.post(
+            f'/api/accounts/{account_id}/secrets',
+            json={'password': 'any'}
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_update_account_preserves_password_when_field_is_omitted(self):
+        account_id = self._insert_account('preserve-password@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET password = ?, client_id = ?, refresh_token = ?
+                WHERE id = ?
+                ''',
+                ('old-password', 'old-client', 'old-refresh', account_id)
+            )
+            db.commit()
+
+        response = self.client.put(f'/api/accounts/{account_id}', json={
+            'email': 'preserve-password@example.com',
+            'client_id': 'new-client',
+            'refresh_token': 'new-refresh',
+            'account_type': 'outlook',
+            'provider': 'outlook',
+            'group_id': 1,
+            'remark': 'updated without password',
+            'status': 'active',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            account = web_outlook_app.get_account_by_id(account_id)
+        self.assertEqual(account['password'], 'old-password')
+        self.assertEqual(account['client_id'], 'new-client')
+        self.assertEqual(account['remark'], 'updated without password')
+
+    def test_update_imap_account_preserves_imap_password_when_field_is_omitted(self):
+        account_id = self._insert_account('preserve-imap@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET account_type = ?, provider = ?, client_id = ?, refresh_token = ?,
+                    imap_host = ?, imap_port = ?, imap_password = ?
+                WHERE id = ?
+                ''',
+                ('imap', 'gmail', '', '', 'imap.gmail.com', 993, 'old-imap-password', account_id)
+            )
+            db.commit()
+
+        response = self.client.put(f'/api/accounts/{account_id}', json={
+            'email': 'preserve-imap@example.com',
+            'account_type': 'imap',
+            'provider': 'gmail',
+            'imap_host': '',
+            'imap_port': 993,
+            'group_id': 1,
+            'remark': 'updated without imap password',
+            'status': 'active',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            account = web_outlook_app.get_account_by_id(account_id)
+        self.assertEqual(account['imap_password'], 'old-imap-password')
+        self.assertEqual(account['remark'], 'updated without imap password')
 
     def test_accounts_api_imports_and_pages_ten_thousand_accounts(self):
         account_lines = [
@@ -296,8 +425,24 @@ class ProjectRuntimeTests(unittest.TestCase):
             return_value={
                 'release_version': 'v2.0.24',
                 'release_url': 'https://example.com/releases/v2.0.24',
+                'release_title': 'v2.0.24',
+                'release_body': '- 新增版本提示弹框\n- 修复更新状态显示',
                 'repository_version': 'v2.0.24',
                 'errors': [],
+            },
+        ), patch.object(
+            web_outlook_app,
+            'fetch_changelog_release_notes',
+            return_value={
+                'source': 'changelog',
+                'title': 'v2.0.24',
+                'items': ['新增版本提示弹框'],
+                'entries': [
+                    {'title': 'v2.0.24', 'items': ['新增版本提示弹框'], 'url': 'https://example.com/changelog'},
+                    {'title': 'v2.0.23', 'items': ['优化版本检查'], 'url': 'https://example.com/changelog'},
+                    {'title': 'v2.0.22', 'items': ['修复更新入口'], 'url': 'https://example.com/changelog'},
+                ],
+                'url': 'https://example.com/changelog',
             },
         ), patch.object(web_outlook_app, 'APP_VERSION', '2.0.23'):
             with self.app.app_context():
@@ -314,6 +459,53 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertEqual(version_status['badge_label'], '可更新')
         self.assertEqual(version_status['latest_version'], 'v2.0.24')
         self.assertIn('v2.0.24', version_status['hint'])
+        self.assertEqual(version_status['release_notes']['source'], 'changelog')
+        self.assertEqual(version_status['release_notes']['title'], 'v2.0.24')
+        self.assertIn('新增版本提示弹框', version_status['release_notes']['items'])
+        self.assertEqual(len(version_status['release_notes']['entries']), 3)
+        self.assertEqual(version_status['release_notes']['entries'][1]['title'], 'v2.0.23')
+
+    def test_version_status_falls_back_to_changelog_release_notes(self):
+        class FakeResponse:
+            text = (
+                '## [2.0.24] - 2026-06-04\n\n- 新增远端更新说明\n- 优化版本弹框\n\n'
+                '## [2.0.23] - 2026-06-03\n\n- 修复版本检查\n\n'
+                '## [2.0.22] - 2026-06-02\n\n- 优化下载入口\n\n'
+                '## [2.0.21] - 2026-06-01\n\n- 不应展示这一条\n'
+            )
+
+            def raise_for_status(self):
+                return None
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_remote_version_snapshot',
+            return_value={
+                'release_version': 'v2.0.24',
+                'release_url': 'https://example.com/releases/v2.0.24',
+                'release_title': 'v2.0.24',
+                'release_body': '',
+                'repository_version': 'v2.0.24',
+                'errors': [],
+            },
+        ), patch.object(web_outlook_app.requests, 'get', return_value=FakeResponse()), patch.object(
+            web_outlook_app,
+            'APP_VERSION',
+            '2.0.23',
+        ):
+            with self.app.app_context():
+                web_outlook_app.VERSION_CHECK_CACHE['payload'] = None
+                web_outlook_app.VERSION_CHECK_CACHE['expires_at'] = 0.0
+
+            response = self.client.get('/api/version-status?refresh=1')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        release_notes = payload['version_status']['release_notes']
+        self.assertEqual(release_notes['source'], 'changelog')
+        self.assertEqual(release_notes['title'], 'v2.0.24')
+        self.assertEqual(release_notes['items'], ['新增远端更新说明', '优化版本弹框'])
+        self.assertEqual([entry['title'] for entry in release_notes['entries']], ['v2.0.24', 'v2.0.23', 'v2.0.22'])
 
     def test_version_status_reports_up_to_date_when_release_matches(self):
         with patch.object(
@@ -468,8 +660,11 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertEqual(launch_response.status_code, 302)
         self.assertEqual(launch_response.headers['Location'], '/#settings')
 
+        with self.app.app_context():
+            expected_version = web_outlook_app.get_login_session_version()
         with anonymous_client.session_transaction() as sess:
             self.assertTrue(sess.get('logged_in'))
+            self.assertEqual(sess.get('login_session_version'), expected_version)
 
         reused_response = anonymous_client.get(payload['launch_url'], follow_redirects=False)
         self.assertEqual(reused_response.status_code, 302)
@@ -1047,6 +1242,106 @@ class ProjectRuntimeTests(unittest.TestCase):
             self.assertEqual(web_outlook_app.get_setting('webdav_backup_enabled'), 'false')
             self.assertEqual(web_outlook_app.get_setting('webdav_backup_url'), '')
 
+    def test_change_login_password_requires_current_password(self):
+        with self.app.app_context():
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('current-password'))
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+
+        missing_current = self.client.put(
+            '/api/settings',
+            json={'login_password': 'new-password-1'},
+        )
+        self.assertEqual(missing_current.status_code, 200)
+        missing_payload = missing_current.get_json()
+        self.assertFalse(missing_payload['success'])
+        self.assertIn('当前密码', missing_payload['error'])
+
+        wrong_current = self.client.put(
+            '/api/settings',
+            json={
+                'login_password': 'new-password-1',
+                'current_login_password': 'wrong-password',
+            },
+        )
+        self.assertEqual(wrong_current.status_code, 200)
+        wrong_payload = wrong_current.get_json()
+        self.assertFalse(wrong_payload['success'])
+        self.assertIn('当前登录密码错误', wrong_payload['error'])
+
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.verify_login_password('current-password'))
+            self.assertEqual(
+                web_outlook_app.get_login_session_version(),
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+
+    def test_change_login_password_invalidates_other_sessions(self):
+        with self.app.app_context():
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('current-password'))
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+
+        other_client = self.app.test_client()
+        with other_client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+        try:
+            response = self.client.put(
+                '/api/settings',
+                json={
+                    'login_password': 'new-password-1',
+                    'current_login_password': 'current-password',
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload['success'], msg=payload.get('error'))
+            self.assertIn('登录密码', payload.get('message', ''))
+
+            with self.app.app_context():
+                self.assertTrue(web_outlook_app.verify_login_password('new-password-1'))
+                self.assertFalse(web_outlook_app.verify_login_password('current-password'))
+                new_version = web_outlook_app.get_login_session_version()
+                self.assertNotEqual(new_version, web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION)
+
+            with self.client.session_transaction() as sess:
+                self.assertTrue(sess.get('logged_in'))
+                self.assertEqual(sess.get('login_session_version'), new_version)
+
+            current_still_ok = self.client.get('/api/settings')
+            self.assertEqual(current_still_ok.status_code, 200)
+            self.assertTrue(current_still_ok.get_json()['success'])
+
+            other_blocked = other_client.get('/api/settings')
+            self.assertEqual(other_blocked.status_code, 401)
+            other_payload = other_blocked.get_json()
+            self.assertFalse(other_payload['success'])
+            self.assertTrue(other_payload.get('need_login'))
+
+            with other_client.session_transaction() as sess:
+                self.assertFalse(sess.get('logged_in'))
+                self.assertIsNone(sess.get('login_session_version'))
+        finally:
+            with self.app.app_context():
+                web_outlook_app.set_setting(
+                    web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                    web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+                )
+                web_outlook_app.set_setting(
+                    'login_password',
+                    web_outlook_app.hash_password('current-password'),
+                )
+
     def test_webdav_backup_settings_save_with_login_password(self):
         with self.app.app_context():
             web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('current-password'))
@@ -1441,6 +1736,58 @@ class ProjectRuntimeTests(unittest.TestCase):
             'uid',
         )
 
+    def test_graph_attachment_metadata_select_uses_base_attachment_fields(self):
+        class GraphAttachmentsResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    'value': [{
+                        'id': 'graph-attachment-1',
+                        'name': 'Invoice-103975.pdf',
+                        'contentType': 'application/pdf',
+                        'size': 15178,
+                        'isInline': False,
+                    }]
+                }
+
+        with patch.object(web_outlook_app, 'get_access_token_graph', return_value='graph-token'), \
+                patch.object(web_outlook_app, 'get_with_proxy_fallback', return_value=GraphAttachmentsResponse()) as request_mock:
+            attachments = web_outlook_app.get_email_attachments_graph(
+                'client-id',
+                'refresh-token',
+                'message-id',
+            )
+
+        params = request_mock.call_args.kwargs['params']
+        self.assertEqual(params['$select'], 'id,name,contentType,size,isInline')
+        self.assertNotIn('contentId', params['$select'])
+        self.assertEqual(attachments, [{
+            'id': 'graph-attachment-1',
+            'name': 'Invoice-103975.pdf',
+            'content_type': 'application/pdf',
+            'size': 15178,
+            'is_inline': False,
+            'content_id': '',
+        }])
+
+    def test_graph_detail_preserves_has_attachments_when_metadata_is_empty(self):
+        detail = {
+            'id': 'graph-message-1',
+            'subject': 'Graph detail',
+            'from': {'emailAddress': {'address': 'sender@example.com'}},
+            'toRecipients': [{'emailAddress': {'address': 'reader@example.com'}}],
+            'ccRecipients': [],
+            'receivedDateTime': '2026-06-15T06:22:14Z',
+            'hasAttachments': True,
+            'body': {'contentType': 'html', 'content': '<p>Body</p>'},
+        }
+
+        email_detail = web_outlook_app.format_graph_email_detail(detail, [])
+
+        self.assertTrue(email_detail['has_attachments'])
+        self.assertEqual(email_detail['attachments'], [])
+
     def test_single_oauth_imap_attachment_download_uses_sequence_id_mode(self):
         account_id = self._insert_account('user@example.com')
         with self.app.app_context():
@@ -1678,6 +2025,95 @@ class FrontendColorPickerTests(unittest.TestCase):
         )
 
 
+class FrontendAccountSearchScopeTests(unittest.TestCase):
+    def test_account_search_scope_defaults_to_current_group_and_remembers_user_choice(self):
+        layout_html = pathlib.Path(
+            ROOT_DIR,
+            'templates',
+            'partials',
+            'index',
+            'layout.html',
+        ).read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+
+        self.assertIn('<option value="all">所有分组</option>', layout_html)
+        self.assertIn('<option value="group" selected>当前分组</option>', layout_html)
+        self.assertIn("select.value = savedScope === 'all' ? 'all' : 'group';", groups_js)
+        self.assertIn("localStorage.setItem('outlook_account_search_scope', normalizedScope);", groups_js)
+
+    def test_empty_account_search_keeps_saved_scope_and_loads_current_group_list(self):
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        empty_branch_start = groups_js.index('if (!query.trim())')
+        empty_branch_end = groups_js.index('if (getAccountSearchTerms(query).length', empty_branch_start)
+        empty_branch = groups_js[empty_branch_start:empty_branch_end]
+
+        self.assertNotIn("setAccountSearchScope('group');", empty_branch)
+        self.assertIn('loadAccountsByGroup(currentGroupId, forceRefresh);', empty_branch)
+
+    def test_search_scope_change_researches_when_query_exists_or_has_tag_filters(self):
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        function_start = groups_js.index('function handleAccountSearchScopeChange')
+        function_end = groups_js.index('function handleAccountPageSizeChange', function_start)
+        function_source = groups_js[function_start:function_end]
+
+        self.assertIn('setAccountSearchScope(value);', function_source)
+        self.assertIn('if (searchQuery && !isTempEmailGroup) {', function_source)
+        self.assertIn('refreshVisibleAccountList(true);', function_source)
+
+    def test_account_search_input_is_saved_and_restored(self):
+        core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+
+        self.assertIn("const ACCOUNT_SEARCH_QUERY_STORAGE_KEY = 'outlook_account_search_query';", groups_js)
+        self.assertIn('function initAccountSearchInput()', groups_js)
+        self.assertIn('function saveAccountSearchQueryPreference(value)', groups_js)
+        self.assertIn('initAccountSearchInput();', core_js)
+        self.assertIn('saveAccountSearchQueryPreference(event.target.value);', core_js)
+
+
+class FrontendAccountListPreferenceTests(unittest.TestCase):
+    def test_account_sort_preference_is_loaded_saved_and_synced(self):
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+
+        self.assertIn("const ACCOUNT_SORT_STORAGE_KEY = 'outlook_account_sort';", groups_js)
+        self.assertIn('function loadAccountSortPreference()', groups_js)
+        self.assertIn('function saveAccountSortPreference()', groups_js)
+        self.assertIn('function syncAccountSortButtons()', groups_js)
+        self.assertIn('const savedAccountSort = loadAccountSortPreference();', groups_js)
+
+        sort_start = groups_js.index('function sortAccounts(sortBy)')
+        sort_end = groups_js.index('function renderFilteredAccountList', sort_start)
+        sort_source = groups_js[sort_start:sort_end]
+
+        self.assertIn('saveAccountSortPreference();', sort_source)
+        self.assertIn('syncAccountSortButtons();', sort_source)
+
+    def test_account_tag_filter_preference_is_loaded_pruned_and_saved(self):
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        tags_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '09-tags.js').read_text(encoding='utf-8')
+
+        self.assertIn("const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'outlook_account_tag_filters';", groups_js)
+        self.assertIn('function loadAccountTagFilterPreference()', groups_js)
+        self.assertIn('function saveAccountTagFilterPreference()', groups_js)
+        self.assertIn('selectedTagFilters = loadAccountTagFilterPreference();', groups_js)
+
+        tag_change_start = groups_js.index('function handleTagFilterChange()')
+        tag_change_end = groups_js.index('// 防抖函数', tag_change_start)
+        tag_change_source = groups_js[tag_change_start:tag_change_end]
+        self.assertIn('saveAccountTagFilterPreference();', tag_change_source)
+
+        load_tags_start = tags_js.index('async function loadTags()')
+        load_tags_end = tags_js.index('function getSelectedTagFilterItems()', load_tags_start)
+        load_tags_source = tags_js[load_tags_start:load_tags_end]
+        self.assertIn('loadAccountTagFilterPreference()', load_tags_source)
+        self.assertIn('saveAccountTagFilterPreference();', load_tags_source)
+
+        clear_start = tags_js.index('function clearTagFilterSelection')
+        clear_end = tags_js.index('// 更新标签筛选下拉框', clear_start)
+        clear_source = tags_js[clear_start:clear_end]
+        self.assertIn('saveAccountTagFilterPreference();', clear_source)
+
+
 class FrontendEmailListSecurityTests(unittest.TestCase):
     def setUp(self):
         self.emails_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '05-emails.js').read_text(encoding='utf-8')
@@ -1700,13 +2136,20 @@ class FrontendEmailListSecurityTests(unittest.TestCase):
     def test_detail_load_error_message_is_rendered_as_text(self):
         self.assertNotIn("${data.error && data.error.message ? data.error.message : '加载失败'}", self.emails_js)
         self.assertIn("const errorText = container.querySelector('.empty-state-text');", self.emails_js)
-        self.assertIn("errorText.textContent = data.error && data.error.message ? data.error.message : '加载失败';", self.emails_js)
+        self.assertIn('const detailErrorMessage = data.error?.message', self.emails_js)
+        self.assertIn("|| '加载失败';", self.emails_js)
+        self.assertIn('errorText.textContent = detailErrorMessage;', self.emails_js)
 
     def test_delete_emails_removes_matching_cached_rows_and_preserves_unrelated_detail(self):
         self.assertIn('function removeDeletedEmailsFromCachedLists(deletedIds, account = currentAccount)', self.emails_js)
         self.assertIn('cacheValue.emails = cacheValue.emails.filter(email => !normalizedIds.has(String(email.id)));', self.emails_js)
         self.assertIn('removeDeletedEmailsFromCachedLists(deletedIds);', self.emails_js)
         self.assertIn('if (currentEmailDetail && deletedIds.has(String(currentEmailDetail.id)))', self.emails_js)
+        self.assertIn('function buildEmailDeleteItems(sourceItems)', self.emails_js)
+        self.assertIn('items', self.emails_js)
+        self.assertIn('method: getRemoteMailboxMethodFallback()', self.emails_js)
+        self.assertIn('await deleteEmails(getSelectedEmailItems());', self.emails_js)
+        self.assertIn('await deleteEmails([currentEmailDetail]);', self.emails_js)
 
 
 class FrontendEmailBodyRetentionAndIframeTests(unittest.TestCase):
@@ -1786,6 +2229,26 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('overflow-y: auto;', settings_css)
         self.assertIn('scrollbar-width: thin;', settings_css)
 
+    def test_forwarding_latency_settings_ui_is_present(self):
+        settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
+        settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
+        extension_js = pathlib.Path(ROOT_DIR, 'browser-extension', 'sidepanel.js').read_text(encoding='utf-8')
+
+        self.assertIn('id="forwardCheckIntervalSeconds"', settings_html)
+        self.assertIn('id="forwardExecutionMode"', settings_html)
+        self.assertIn('id="forwardParallelWorkers"', settings_html)
+        self.assertIn('syncForwardExecutionModeUI()', settings_html)
+        self.assertIn('data.settings.forward_check_interval_seconds', settings_js)
+        self.assertIn('settings.forward_check_interval_seconds = forwardSeconds;', settings_js)
+        self.assertIn('settings.forward_execution_mode = forwardExecutionMode;', settings_js)
+        self.assertIn('settings.forward_parallel_workers = forwardParallelWorkers;', settings_js)
+        self.assertIn("delayEl.value = '0';", settings_js)
+        self.assertIn("forwardExecutionMode === 'parallel'", settings_js)
+        self.assertIn('id="settingForwardCheckIntervalSeconds"', extension_js)
+        self.assertIn('id="settingForwardExecutionMode"', extension_js)
+        self.assertIn('forward_check_interval_seconds: forwardCheckIntervalSeconds', extension_js)
+        self.assertIn('forward_account_delay_seconds: forwardAccountDelaySeconds', extension_js)
+
     def test_retention_status_poll_uses_backoff_constants(self):
         settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
 
@@ -1806,7 +2269,80 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         temp_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '03-temp-emails.js').read_text(encoding='utf-8')
 
         self.assertIn('const normalizedSearchQuery = searchQuery.toLowerCase();', temp_js)
-        self.assertIn('cloudflareGlobalLabel.toLowerCase().includes(normalizedSearchQuery)', temp_js)
+        self.assertIn('label.toLowerCase().includes(normalizedSearchQuery)', temp_js)
+
+    def test_cloudflare_global_entry_does_not_duplicate_channel_name(self):
+        temp_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '03-temp-emails.js').read_text(encoding='utf-8')
+
+        self.assertIn('const label = `Cloudflare所有邮件 · ${channelName}`;', temp_js)
+        self.assertIn('<span class="account-status-pill provider" style="--pill-accent: #f48120">Cloudflare</span>', temp_js)
+        self.assertNotIn('<span class="account-status-pill muted">${escapeHtml(channelName)}</span>', temp_js)
+
+    def test_cloudflare_temp_email_batch_generate_frontend_contract(self):
+        temp_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '03-temp-emails.js').read_text(encoding='utf-8')
+        modal_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '06-modals-toast.css').read_text(encoding='utf-8')
+
+        self.assertIn('id="cloudflareGenerateCount"', temp_js)
+        self.assertIn('temp-email-provider-modal-content', temp_js)
+        self.assertIn('temp-email-provider-modal-body', temp_js)
+        self.assertIn('.temp-email-provider-modal-body', modal_css)
+        self.assertIn('overflow-y: auto;', modal_css)
+        self.assertIn('<textarea class="form-input" id="cloudflareUsername"', temp_js)
+        self.assertIn('一行一个用户名', temp_js)
+        self.assertIn('id="cloudflareAiGenerateBtn"', temp_js)
+        self.assertIn('async function generateCloudflareAiUsernames()', temp_js)
+        self.assertIn("fetch('/api/cloudflare/ai-usernames/generate'", temp_js)
+        self.assertIn('id="cloudflareGenerateTagOptions"', temp_js)
+        self.assertIn('async function ensureCloudflareGenerateTagsLoaded()', temp_js)
+        self.assertIn("typeof allTags === 'undefined' || !Array.isArray(allTags)", temp_js)
+        self.assertIn('body.count = parseInt(document.getElementById(\'cloudflareGenerateCount\')?.value || \'1\', 10);', temp_js)
+        self.assertIn('const usernameLines = getCloudflareUsernameLines();', temp_js)
+        self.assertIn('body.usernames = usernameLines;', temp_js)
+        self.assertIn('usernameLines.length > 0 && usernameLines.length !== body.count', temp_js)
+        self.assertIn('body.tag_ids = getCloudflareGenerateSelectedTagIds();', temp_js)
+        self.assertIn("const useCloudflareBatch = provider === 'cloudflare';", temp_js)
+        self.assertIn("fetch(useCloudflareBatch ? '/api/temp-emails/generate-batch' : '/api/temp-emails/generate'", temp_js)
+        self.assertIn('formatCloudflareBatchFailureSummary(data.failures)', temp_js)
+        self.assertNotIn("body.username = document.getElementById('cloudflareUsername')", temp_js)
+        self.assertNotIn('data.ai_fallback_used', temp_js)
+
+    def test_temp_email_import_cloudflare_channel_examples_and_tags(self):
+        dialog_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-primary.html').read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
+
+        self.assertIn('临时邮箱类型', dialog_html)
+        self.assertIn('id="importChannelSelect"', dialog_html)
+        self.assertIn('id="importCloudflareChannelSelect"', dialog_html)
+        self.assertIn('id="importCloudflareImportMode"', dialog_html)
+        self.assertIn('自动拉取邮箱导入', dialog_html)
+        self.assertIn('手动导入', dialog_html)
+        self.assertIn("const isTagField = !!field.querySelector('#importTagFilterDropdown');", groups_js)
+        self.assertIn("field.style.display = isTempGroup ? (isTagField ? '' : 'none') : '';", groups_js)
+        self.assertIn('自动从所选 Cloudflare 渠道拉取邮箱地址并导入，不拉取 JWT。', groups_js)
+        self.assertIn('手动导入不再支持 邮箱----JWT', groups_js)
+        self.assertIn('loadCloudflareChannelsForImport()', groups_js)
+        self.assertIn("'/api/temp-emails/import-cloudflare-addresses'", settings_js)
+        self.assertIn('payload.cloudflare_channel_id = cloudflareChannelId;', settings_js)
+        self.assertIn('tag_ids: tagIds', settings_js)
+
+    def test_cloudflare_ai_username_settings_frontend_contract(self):
+        settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
+        settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
+
+        self.assertIn('id="settingsCloudflareAiEnabled"', settings_html)
+        self.assertIn('id="settingsCloudflareAiApiUrl"', settings_html)
+        self.assertIn('id="settingsCloudflareAiModel"', settings_html)
+        self.assertIn('id="settingsCloudflareAiApiKey"', settings_html)
+        self.assertIn('id="settingsCloudflareAiClearApiKey"', settings_html)
+        self.assertIn('id="settingsCloudflareAiPrompt"', settings_html)
+        self.assertIn('id="testCloudflareAiBtn"', settings_html)
+        self.assertIn('async function testCloudflareAiUsernames()', settings_js)
+        self.assertIn("fetch('/api/cloudflare/ai-usernames/test'", settings_js)
+        self.assertIn("document.getElementById('settingsCloudflareAiApiKey').value = '';", settings_js)
+        self.assertIn('if (cloudflareAiApiKey) {', settings_js)
+        self.assertIn('settings.cloudflare_ai_username_api_key = cloudflareAiApiKey;', settings_js)
+        self.assertIn('settings.cloudflare_ai_username_clear_api_key = true;', settings_js)
 
     def test_account_search_terms_are_not_limited_to_emails(self):
         groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
@@ -1920,6 +2456,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("if (idMode === 'graph')", emails_js)
         self.assertIn("if (idMode === 'uid' || idMode === 'sequence')", emails_js)
         self.assertIn('method: getCurrentEmailRemoteActionMethod(selectedEmail)', emails_js)
+        self.assertIn('appendEmailIdModeParam(query, selectedEmail);', emails_js)
         self.assertIn("query.set('method', getCurrentEmailRemoteActionMethod(email));", emails_js)
         self.assertIn('const method = encodeURIComponent(getCurrentEmailRemoteActionMethod(currentEmailDetail));', emails_js)
         self.assertIn("id_mode: data.email?.id_mode || selectedEmail?.id_mode || ''", emails_js)
@@ -1939,7 +2476,8 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('id="settingsShowAccountSortOrder"', settings_html)
         self.assertIn('id="settingsShowGroupId"', settings_html)
         self.assertIn('id="editSortOrder"', dialog_html)
-        self.assertIn("let currentSortBy = 'sort_order';", groups_js)
+        self.assertIn("const ACCOUNT_SORT_DEFAULT_BY = 'sort_order';", groups_js)
+        self.assertIn('const savedAccountSort = loadAccountSortPreference();', groups_js)
         self.assertIn("currentSortBy === 'sort_order'", groups_js)
         self.assertIn("currentSortBy === 'created_at'", groups_js)
         self.assertNotIn("currentSortBy === 'refresh_time'", groups_js)
@@ -1964,6 +2502,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         gptmail_section = settings_html.split('id="settingsAccessSection"', 1)[1].split('</section>', 1)[0]
 
         self.assertIn('GPTMail 临时邮箱设置', settings_html)
+        self.assertIn('id="settingsCurrentPassword"', general_section)
         self.assertIn('id="settingsPassword"', general_section)
         self.assertIn('id="settingsExternalApiKey"', general_section)
         self.assertIn('id="settingsShowGroupId"', general_section)
@@ -1971,6 +2510,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
 
         self.assertIn('id="settingsApiKey"', gptmail_section)
         self.assertNotIn('id="settingsPassword"', gptmail_section)
+        self.assertNotIn('id="settingsCurrentPassword"', gptmail_section)
         self.assertNotIn('id="settingsExternalApiKey"', gptmail_section)
 
     def test_temp_mail_settings_sections_are_placed_last(self):
@@ -1978,13 +2518,37 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
 
         self.assertLess(settings_html.index('data-target="settingsGeneralSection"'), settings_html.index('data-target="settingsRefreshSection"'))
         self.assertLess(settings_html.index('data-target="settingsRefreshSection"'), settings_html.index('data-target="forwardingSettingsSection"'))
-        self.assertLess(settings_html.index('data-target="forwardingSettingsSection"'), settings_html.index('data-target="settingsAccessSection"'))
+        self.assertLess(settings_html.index('data-target="forwardingSettingsSection"'), settings_html.index('data-target="settingsCloudflareSection"'))
+        self.assertLess(settings_html.index('data-target="settingsCloudflareSection"'), settings_html.index('data-target="settingsAccessSection"'))
         self.assertLess(settings_html.index('data-target="settingsAccessSection"'), settings_html.index('data-target="settingsDuckMailSection"'))
-        self.assertLess(settings_html.index('data-target="settingsDuckMailSection"'), settings_html.index('data-target="settingsCloudflareSection"'))
 
-        self.assertLess(settings_html.index('id="forwardingSettingsSection"'), settings_html.index('id="settingsAccessSection"'))
+        self.assertLess(settings_html.index('id="forwardingSettingsSection"'), settings_html.index('id="settingsCloudflareSection"'))
+        self.assertLess(settings_html.index('id="settingsCloudflareSection"'), settings_html.index('id="settingsAccessSection"'))
         self.assertLess(settings_html.index('id="settingsAccessSection"'), settings_html.index('id="settingsDuckMailSection"'))
-        self.assertLess(settings_html.index('id="settingsDuckMailSection"'), settings_html.index('id="settingsCloudflareSection"'))
+
+    def test_cloudflare_channel_form_actions_distinguish_create_and_reset(self):
+        settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
+        settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
+        cloudflare_section = settings_html.split('id="settingsCloudflareSection"', 1)[1].split('</section>', 1)[0]
+
+        self.assertIn('id="saveCloudflareChannelBtn"', cloudflare_section)
+        self.assertIn('onclick="saveCloudflareChannel()">创建渠道</button>', cloudflare_section)
+        self.assertIn('id="resetCloudflareChannelBtn"', cloudflare_section)
+        self.assertIn('onclick="resetCloudflareChannelForm()">清空表单</button>', cloudflare_section)
+        self.assertIn("if (saveBtn) saveBtn.textContent = isEditing ? '保存渠道' : '创建渠道';", settings_js)
+        self.assertIn("if (resetBtn) resetBtn.textContent = isEditing ? '新建渠道' : '清空表单';", settings_js)
+        self.assertIn("showToast('请填写渠道名称和 Worker 域名', 'error');", settings_js)
+        self.assertNotIn('请填写渠道名称、Worker 域名和邮箱域名', settings_js)
+        self.assertIn('setCloudflareChannelFormMode(false);', settings_js)
+        self.assertIn('setCloudflareChannelFormMode(true);', settings_js)
+
+    def test_settings_sections_keep_multiple_panels_in_content_column(self):
+        settings_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '06-modals-toast.css').read_text(encoding='utf-8')
+
+        self.assertIn('.settings-section > .settings-panel + .settings-panel {', settings_css)
+        self.assertIn('.settings-section > .settings-panel {', settings_css)
+        self.assertIn('grid-column: 2;', settings_css)
+        self.assertIn('grid-row: 1;', settings_css)
 
     def test_version_popover_mentions_docker_only_online_update_setup(self):
         layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
@@ -1995,6 +2559,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
 
     def test_version_chip_shows_upgrade_badge_markup_and_logic(self):
         layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
         navbar_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '02-navbar.css').read_text(encoding='utf-8')
 
@@ -2006,6 +2571,20 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("const shouldShowUpgradeBadge = state === 'update_available';", core_js)
         self.assertIn('upgradeBadgeEl.hidden = !shouldShowUpgradeBadge;', core_js)
         self.assertIn('loadVersionStatus();', core_js)
+        self.assertIn('showUpdateNoticeIfNeeded(payload.version_status);', core_js)
+        self.assertNotIn('window.setTimeout(showReleaseNoticeIfNeeded, 900);', core_js)
+        self.assertIn('id="releaseNoticeDockerUpdateBtn"', settings_html)
+        self.assertIn('Docker 在线更新', settings_html)
+        self.assertIn('前往下载', settings_html)
+        self.assertIn('仅 Docker 版本支持在线更新', settings_html)
+        self.assertIn('README 中的「启用界面 Docker 在线更新」', settings_html)
+        self.assertIn("document.getElementById('releaseNoticeDockerUpdateBtn')", core_js)
+        self.assertIn('releaseNotes.entries', core_js)
+        self.assertIn('releaseNotes.entries.slice(0, 3)', core_js)
+        self.assertIn('updateButton.hidden = !(enabled && updateAvailable);', core_js)
+        self.assertIn('updateButton.disabled = !available || running;', core_js)
+        self.assertIn("const dockerHint = document.getElementById('releaseNoticeDockerHint');", core_js)
+        self.assertIn('dockerHint.hidden = !updateAvailable || available;', core_js)
         self.assertIn('.app-version-chip__upgrade-badge {', navbar_css)
         self.assertIn('background: linear-gradient(180deg, #fef3c7 0%, #fde68a 100%);', navbar_css)
         self.assertIn('color: #92400e;', navbar_css)
@@ -2020,6 +2599,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('.app-version-chip__upgrade-badge[hidden] {', navbar_css)
 
     def test_refresh_management_ui_uses_account_workbench_layout(self):
+        layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
         refresh_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '08-refresh.js').read_text(encoding='utf-8')
@@ -2031,8 +2611,17 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('id="stopRefreshBtn"', settings_html)
         self.assertIn('id="refreshLogsList"', settings_html)
         self.assertIn('id="refreshSelectedSummary"', settings_html)
+        self.assertIn('id="refreshSelectionModeBtn"', settings_html)
         self.assertIn('id="refreshSelectVisibleBtn"', settings_html)
         self.assertIn('id="refreshSelectedBtn"', settings_html)
+        self.assertIn('id="refreshCopySelectedBtn"', settings_html)
+        self.assertIn('id="refreshExportSelectedBtn"', settings_html)
+        self.assertIn('id="refreshEnableForwardingBtn"', settings_html)
+        self.assertIn('id="refreshDisableForwardingBtn"', settings_html)
+        self.assertIn('id="refreshProxyBtn"', settings_html)
+        self.assertIn('id="refreshAddTagBtn"', settings_html)
+        self.assertIn('id="refreshRemoveTagBtn"', settings_html)
+        self.assertIn('id="refreshMoveGroupBtn"', settings_html)
         self.assertIn('id="refreshDeleteSelectedBtn"', settings_html)
         self.assertIn('class="refresh-account-table-wrap"', settings_html)
         self.assertIn('data-status="never"', settings_html)
@@ -2048,11 +2637,22 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("data.type === 'stopped'", refresh_js)
         self.assertIn('/api/accounts/refresh-failed-stream', refresh_js)
         self.assertIn("selectedAccountIds: new Set()", refresh_js)
+        self.assertIn("selectionMode: false", refresh_js)
+        self.assertIn("function toggleRefreshSelectionMode()", refresh_js)
+        self.assertIn("function handleRefreshAccountRowClick(event)", refresh_js)
+        self.assertIn("function handleRefreshSelectionPointerDown(event)", refresh_js)
         self.assertIn("function toggleRefreshVisibleSelection()", refresh_js)
         self.assertIn("function clearRefreshSelectionForScopeChange()", refresh_js)
         self.assertIn("if (nextQuery !== refreshModalState.query)", refresh_js)
         self.assertIn("if (nextStatus !== refreshModalState.status)", refresh_js)
         self.assertIn("async function refreshSelectedRefreshAccounts()", refresh_js)
+        self.assertIn("async function copySelectedRefreshAccountsWithAliases()", refresh_js)
+        self.assertIn("function exportSelectedRefreshAccounts()", refresh_js)
+        self.assertIn("async function enableForwardingForSelectedRefreshAccounts()", refresh_js)
+        self.assertIn("async function disableForwardingForSelectedRefreshAccounts()", refresh_js)
+        self.assertIn("function showRefreshBatchProxyModal()", refresh_js)
+        self.assertIn("function showRefreshBatchTagModal(type)", refresh_js)
+        self.assertIn("function showRefreshBatchMoveGroupModal()", refresh_js)
         self.assertIn("async function deleteSelectedRefreshAccounts()", refresh_js)
         self.assertIn("await refreshVisibleAccountList(true);", refresh_js)
         self.assertIn("fetch('/api/accounts/refresh-selected-stream'", refresh_js)
@@ -2061,8 +2661,19 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("fetch('/api/accounts/batch-delete'", refresh_js)
         self.assertIn('<table class="refresh-account-table">', refresh_js)
         self.assertIn('class="refresh-account-select-checkbox"', refresh_js)
+        self.assertIn("class=\"refresh-account-row ${rowClassNames.join(' ')}\"", refresh_js)
         self.assertIn("function setRefreshStatusFilter(status, triggerEl = null)", refresh_js)
         self.assertIn("async function openRefreshModalWithStatus(status = 'all')", refresh_js)
+        self.assertIn("function withAccountBatchSelectionContext(context, callback)", batch_js)
+        self.assertIn("function getMainAccountBatchSelectionContext()", batch_js)
+        self.assertIn("function getCurrentAccountBatchSelectionContext()", batch_js)
+        self.assertIn("function getAccountBatchSelectedIds(context = getCurrentAccountBatchSelectionContext())", batch_js)
+        self.assertIn("function copySelectedAccountsWithAliases()", batch_js)
+        self.assertIn("async function updateForwardingForSelectedAccounts(targetEnabled)", batch_js)
+        self.assertIn("async function deleteSelectedAccounts()", batch_js)
+        self.assertIn('id="batchRefreshTokensBtn"', layout_html)
+        self.assertIn('onclick="copySelectedAccountsWithAliases()"', layout_html)
+        self.assertIn('onclick="showBatchProxyModal()"', layout_html)
         self.assertNotIn('showFailedListFromData', refresh_js)
         self.assertNotIn('loadRefreshLogs', refresh_js)
         self.assertNotIn('setRefreshProgressBanner', refresh_js)
@@ -2072,9 +2683,41 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('.refresh-account-table-wrap', modal_css)
         self.assertIn('.refresh-account-table', modal_css)
         self.assertIn('.refresh-batch-actions', modal_css)
+        self.assertIn('.refresh-list-panel__actions', modal_css)
+        self.assertIn('display: none;', modal_css.split('.refresh-batch-actions {', 1)[1].split('}', 1)[0])
+        self.assertIn('position: absolute;', modal_css.split('.refresh-batch-actions {', 1)[1].split('}', 1)[0])
+        self.assertIn('.refresh-batch-actions.is-active', modal_css)
+        self.assertIn('display: flex;', modal_css.split('.refresh-batch-actions.is-active {', 1)[1].split('}', 1)[0])
+        self.assertIn('.refresh-selection-mode-btn.active', modal_css)
+        self.assertIn('.refresh-account-row.is-selected', modal_css)
+        self.assertIn('.refresh-account-row.is-disabled', modal_css)
         self.assertIn('.refresh-account-select-checkbox', modal_css)
         self.assertIn('.refresh-filter-chip', modal_css)
         self.assertNotIn('.refresh-progress-banner', modal_css)
+
+
+class FrontendMailFetchErrorTests(unittest.TestCase):
+    def test_remote_mail_failures_keep_details_for_background_and_browser_errors(self):
+        emails_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '05-emails.js').read_text(encoding='utf-8')
+
+        self.assertIn('showBackgroundMailFetchErrorModal(options.context, fetchErrorDetails);', emails_js)
+        self.assertIn('showBackgroundMailFetchErrorModal(context, { browser: browserError });', emails_js)
+        self.assertIn('errorMessage = getFetchErrorMessage(error)', emails_js)
+
+    def test_background_mail_error_modal_is_deduplicated_with_a_cooldown(self):
+        emails_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '05-emails.js').read_text(encoding='utf-8')
+
+        self.assertIn('const BACKGROUND_MAIL_ERROR_MODAL_COOLDOWN_MS = 5 * 60 * 1000;', emails_js)
+        self.assertIn('function showBackgroundMailFetchErrorModal(context, details)', emails_js)
+        self.assertIn('now - lastBackgroundMailErrorModal.shownAt < BACKGROUND_MAIL_ERROR_MODAL_COOLDOWN_MS', emails_js)
+
+    def test_mail_error_modal_translates_proxy_and_network_scenarios(self):
+        core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
+
+        self.assertIn('const reasonCode = err.reason_code || code;', core_js)
+        self.assertIn("reasonCode === 'MAIL_PROXY_FAILED'", core_js)
+        self.assertIn("reasonCode === 'MAIL_NETWORK_TIMEOUT'", core_js)
+        self.assertIn("reasonCode === 'MAIL_NETWORK_FAILED'", core_js)
 
 
 class DesktopPackagedRuntimeTests(unittest.TestCase):
@@ -2180,6 +2823,21 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
                 web_outlook_app.DEFAULT_APP_TIMEZONE,
             )
 
+    def test_init_db_derives_forward_seconds_from_legacy_minutes(self):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                "DELETE FROM settings WHERE key IN ('forward_check_interval_minutes', 'forward_check_interval_seconds')"
+            )
+            db.execute(
+                "INSERT INTO settings (key, value) VALUES ('forward_check_interval_minutes', '45')"
+            )
+            db.commit()
+
+            web_outlook_app.init_db()
+
+            self.assertEqual(web_outlook_app.get_setting('forward_check_interval_seconds'), '2700')
+
     def test_scheduler_uses_default_timezone_when_legacy_database_lacks_setting(self):
         class FakeScheduler:
             def __init__(self, timezone=None):
@@ -2199,12 +2857,16 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         def fake_cron_trigger(**kwargs):
             return {'trigger': 'cron', 'kwargs': kwargs}
 
+        def fake_interval_trigger(**kwargs):
+            return {'trigger': 'interval', 'kwargs': kwargs}
+
         with self.app.app_context():
             web_outlook_app.init_db()
             self.assertEqual(web_outlook_app.get_setting('app_timezone'), web_outlook_app.DEFAULT_APP_TIMEZONE)
 
         with patch('apscheduler.schedulers.background.BackgroundScheduler', FakeScheduler), \
              patch('apscheduler.triggers.cron.CronTrigger', side_effect=fake_cron_trigger), \
+             patch('apscheduler.triggers.interval.IntervalTrigger', side_effect=fake_interval_trigger), \
              patch('atexit.register'), \
              patch('builtins.print'):
             scheduler = web_outlook_app.init_scheduler()
@@ -2214,7 +2876,7 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         self.assertEqual(str(scheduler.timezone), web_outlook_app.DEFAULT_APP_TIMEZONE)
         self.assertTrue(any(job.get('id') == 'token_refresh' for job in scheduler.jobs))
 
-    def test_scheduler_supports_forward_interval_sixty_minutes(self):
+    def test_scheduler_uses_second_forward_interval_with_legacy_minute_fallback(self):
         class FakeScheduler:
             def __init__(self, timezone=None):
                 self.timezone = timezone
@@ -2233,13 +2895,20 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         def fake_cron_trigger(**kwargs):
             return {'trigger': 'cron', 'kwargs': kwargs}
 
+        def fake_interval_trigger(**kwargs):
+            return {'trigger': 'interval', 'kwargs': kwargs}
+
         with self.app.app_context():
             web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            db.execute("DELETE FROM settings WHERE key = 'forward_check_interval_seconds'")
+            db.commit()
             self.assertTrue(web_outlook_app.set_setting('forward_check_interval_minutes', '60'))
             web_outlook_app.shutdown_scheduler()
 
         with patch('apscheduler.schedulers.background.BackgroundScheduler', FakeScheduler), \
              patch('apscheduler.triggers.cron.CronTrigger', side_effect=fake_cron_trigger), \
+             patch('apscheduler.triggers.interval.IntervalTrigger', side_effect=fake_interval_trigger), \
              patch('atexit.register'), \
              patch('builtins.print'):
             scheduler = web_outlook_app.init_scheduler()
@@ -2247,8 +2916,10 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         self.assertIsInstance(scheduler, FakeScheduler)
         self.assertTrue(scheduler.started)
         forward_job = next(job for job in scheduler.jobs if job.get('id') == 'forward_mail')
-        self.assertEqual(forward_job['trigger']['kwargs']['minute'], 0)
-        self.assertNotIn('*/60', str(forward_job['trigger']['kwargs']))
+        self.assertEqual(forward_job['trigger']['trigger'], 'interval')
+        self.assertEqual(forward_job['trigger']['kwargs']['seconds'], 3600)
+        self.assertEqual(forward_job['max_instances'], 1)
+        self.assertTrue(forward_job['coalesce'])
 
     def test_scheduler_atexit_callback_is_idempotent_after_manual_shutdown(self):
         registered_callbacks = []
@@ -2275,12 +2946,16 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         def fake_cron_trigger(**kwargs):
             return {'trigger': 'cron', 'kwargs': kwargs}
 
+        def fake_interval_trigger(**kwargs):
+            return {'trigger': 'interval', 'kwargs': kwargs}
+
         with self.app.app_context():
             web_outlook_app.init_db()
             web_outlook_app.shutdown_scheduler()
 
         with patch('apscheduler.schedulers.background.BackgroundScheduler', FakeScheduler), \
              patch('apscheduler.triggers.cron.CronTrigger', side_effect=fake_cron_trigger), \
+             patch('apscheduler.triggers.interval.IntervalTrigger', side_effect=fake_interval_trigger), \
              patch('atexit.register', side_effect=lambda fn: registered_callbacks.append(fn)), \
              patch('builtins.print'):
             scheduler = web_outlook_app.init_scheduler()

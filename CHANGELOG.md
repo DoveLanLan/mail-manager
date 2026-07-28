@@ -6,6 +6,459 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Added
+- 新增官方运维脚本 `scripts/reset_login_password.py`：忘记 Web 登录密码时可在主机或容器内交互式重置（不需要旧密码）；写入 bcrypt 哈希、轮换 `login_session_version` 使既有会话失效，并记录审计日志。
+- 补充 `tests/test_reset_login_password.py` 覆盖密码校验、写库、会话轮换与交互约束。
+
+### Changed
+- 文档明确 `LOGIN_PASSWORD` **仅在首次初始化**（库中尚无 `settings.login_password`）时写入默认值；实例已写库后改环境变量不会覆盖当前登录密码。
+- README / `docs/security.md` / `docs/troubleshooting.md` 补充忘记密码重置步骤与 Docker `docker exec -it` 示例，并说明脚本仅支持交互式 TTY（无 `--password` / 管道传密）。
+
+## [3.0.0] - 2026-07-27
+
+### Added
+- 分组 / 账号代理 URL 支持 `{mail}` 占位符：出站时按邮箱 local-part（仅保留字母数字并小写）展开，配置原样存库、API/编辑回显不展开；可对接 [Resin](https://github.com/Resinat/Resin) 等粘性代理池。
+- 上传账号自动授权：优先使用上传记录自身 `proxy_url`，否则继承分组代理模板，OAuth 全程固定主代理（不做中途 failover）。
+- 环境变量 `LOG_LEVEL`（`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO`）控制全局日志级别；默认 INFO 输出出站 `[代理]` 详情（密码打码，含 Resin Platform/Account）。
+- 出站代理使用日志覆盖拉信、Token 刷新、IMAP socket、Outlook 自动授权等路径。
+
+### Fixed
+- 修复 Token 刷新未尊重账号级代理 override、仅读取分组代理的问题；现与邮件拉取一致：账号 override → 分组继承 → `{mail}` 展开；定时刷新无 Flask context 时正确传入 `db`。
+- 修复 SOCKS 代理「有用户名、密码为空」时 PySocks 退化为 NO AUTH、Resin 收不到 Platform.Account 的问题：传输层补占位密码强制 UserPass。
+- 修复编辑默认分组（前端提交 `parent_id=null` 且父级未变）被误判为「不可移动」的问题。
+- Token / 批量刷新相关查询补选账号 `proxy_url` / fallback 列，避免 resolved 配置丢失账号 override。
+
+### Changed
+- `get_account_proxy_url` / `get_account_proxy_failover_urls` 改为返回运行时展开后的出站代理；存储与展示仍走不展开的 config 路径。
+- Graph 自动授权：配置了应用代理时 `trust_env=False`，避免与环境代理叠加。
+- 界面与文档提示优先 `socks5h://`，并说明 `{mail}`、Resin 示例与 `LOG_LEVEL=WARNING` 降噪。
+
+### Important
+- **行为变化：** 配置了账号级代理的邮箱，Token 刷新现在也会走该代理（此前可能仍走分组/直连）。
+- **行为变化：** SOCKS URL 形如 `user:@host` / `user@host` 会发送 UserPass（空密码用占位符）；非 Resin、且依赖「有用户名但 NO AUTH」的代理可能不兼容。
+- 批量拉信 / 刷新在默认 `LOG_LEVEL=INFO` 下日志较多；生产可设 `LOG_LEVEL=WARNING` 关闭 `[代理]` 等 INFO 输出。
+- `{mail}` 净化后不同前缀可能碰撞（如 `a.b` 与 `ab`）；纯非字母数字 local-part 可能展开为空账号段。
+
+## [2.9.1] - 2026-07-27
+
+### Added
+- 邮件删除支持标准 IMAP 账号与 Outlook OAuth IMAP 回退：按文件夹标记 `\\Deleted` 后 `EXPUNGE` 永久删除。
+- `POST /api/emails/delete` 推荐使用与标已读一致的 `items` / `method` / `folder` 请求体；浏览器扩展与 Web 前端同步传 `id_mode`。
+
+### Fixed
+- 修复 CSRF 校验失败被全局 400 处理器吞成「请求格式错误」的问题（Docker 下导入账号 / 手动 OAuth 换 token 常见）。现返回 `csrf_error: true` 与明确文案，前端可自动刷新 CSRF 并重试一次。
+- 修复 Graph 删除结果未返回 `deleted_ids`，以及 IMAP 删除此前直接提示「暂不支持」的问题；部分成功时前端按实际删除 ID 更新列表。
+
+### Changed
+- README / API 文档同步说明：邮件删除在 Graph 与 IMAP 路径均可用；兼容仅传 `ids` 的旧客户端。
+
+## [2.9.0] - 2026-07-27
+
+### Changed
+- 手动 OAuth 助手默认改为 **GraphAPI** 单资源权限：`offline_access` + `Mail.Read` + `Mail.ReadWrite` + `User.Read`（不再默认申请 IMAP）。
+- Outlook 邮箱自动授权默认模式改为 **GraphAPI**；授权面板与日志文案由 `Graph-only（不含 IMAP 权限）` 调整为 `GraphAPI`，IMAP 选项统一为 `IMAP授权`。
+- 自动授权 GraphAPI 模式 scope 与 `OAUTH_GRAPH_SCOPES` 对齐，在原有 `Mail.Read` 基础上增加 `Mail.ReadWrite`、`User.Read`。
+- README 同步说明：手动授权默认 GraphAPI；需要 IMAP 时请在「Outlook邮箱授权」面板显式选择 `IMAP授权`。
+
+### Fixed
+- 修复 GraphAPI 授权账号可读信但标记已读失败的问题（Graph 返回 `403 ErrorAccessDenied` / `EMAIL_MARK_READ_FAILED`），根因是授权时未申请 `Mail.ReadWrite`。
+
+### Important
+- **已用旧 Graph-only（仅 `Mail.Read`）授权的账号需重新授权**，才能获得写权限（标已读等）。
+- 手动 OAuth / 默认 GraphAPI 拿到的 token **不能用于 IMAP**；IMAP 请走自动授权的 `IMAP授权` 模式。
+
+## [2.8.10] - 2026-07-26
+
+### Changed
+- Outlook 上传账号管理端分页档位调整为 `10` / `20` / `50` / `100`，默认 `20`（与 API 默认对齐）；本地记忆的非法旧档位会回落到默认值。
+- 「添加新账号」表单改为单行布局，授权弹窗加宽并微调表格列宽；使用说明默认折叠。
+- 标签筛选弹窗宽度从 `320px` 调整为 `250px`。
+
+### Fixed
+- 修复添加账号面板中标签下拉弹窗被父级 `overflow: hidden` 裁切的问题。
+
+## [2.8.9] - 2026-07-25
+
+### Fixed
+- 修复 Outlook 邮件详情失败时错误细节丢失：Graph / OAuth IMAP 详情改为返回结构化错误（code / type / status / details / trace_id），Graph 失败回退 IMAP 时透传各协议尝试结果，避免接口 HTTP 200 但页面只显示「加载失败」。
+- 邮件详情前端兼容 `error` 为字符串或对象，并在存在协议级 `details` 时提供「点击查看详情」入口，复用列表侧失败弹窗。
+
+### Changed
+- Outlook OAuth IMAP 详情对代理 / 超时 / 连接等传输类错误自动有限重试 1 次（认证失败、文件夹不存在、token 失效等不重试），降低间歇性读信失败概率。
+
+## [2.8.8] - 2026-07-23
+
+### Fixed
+- 修复「全部邮件」拉取失败时错误细节丢失：`merge_folder_results` 现在会透传 Graph / IMAP 各协议的结构化错误（code / type / status / trace_id / details），避免弹窗只显示「无法获取邮件，所有方式均失败」且字段全为 `-`。
+- 邮件获取失败详情弹窗支持按文件夹展开协议级错误（如「收件箱 / Graph API」「收件箱 / IMAP（新服务器）」），便于排查 token 刷新成功但读信失败等问题。
+
+## [2.8.7] - 2026-07-19
+
+### Changed
+- 分组代理、账号代理、批量代理与上传账号代理界面补充 SOCKS5 建议提示：IMAP 令牌请求仅支持 HTTPS CONNECT / SOCKS5 代理，普通 HTTP 代理不可用；placeholder 优先展示 `socks5://` 示例。
+
+## [2.8.6] - 2026-07-19
+
+### Added
+- Telegram 转发支持可选 Topic ID（`telegram_topic_id` / `message_thread_id`），可将消息发到话题群组指定话题；不填写时行为与原来一致。
+- Outlook 上传账号列表支持按授权状态筛选（全部 / 未授权 / 已授权），并与关键词搜索组合过滤。
+- 上传账号管理表格新增「账号代理」列，展示脱敏后的代理地址（去除凭据、路径与查询参数）。
+- 上传账号分页提供 `100` / `200` / `500` / `1000` 档位，管理端默认 `200` 并本地记忆偏好。
+
+### Changed
+- `GET /api/outlook-upload-accounts` 支持 `auth_status`；`page_size` 最大提升至 `1000`；列表序列化返回脱敏后的 `proxy_url`。
+- 邮件获取错误响应补充 `reason_code`、`category`、`proxy_configured`、`retryable` 等字段，前端可更清晰展示网络 / 代理 / TLS 等原因。
+
+### Fixed
+- 完善 IMAP / 邮件获取错误分类与用户提示，避免笼统失败信息。
+- 上传账号列表并发请求仅应用最新响应，避免旧分页结果覆盖当前筛选结果。
+
+## [2.8.5] - 2026-07-14
+
+
+### Added
+- Outlook 上传账号支持设置目标分组、标签与账号代理；Graph 授权成功并**新建**正式账号时自动写入。
+- 上传账号管理支持多选批量删除，以及按当前授权模式串行批量授权。
+- 正式账号列表支持批量「加入自动授权」；入队时同步复制分组、标签与代理到上传暂存表。
+- 新增接口：`POST /api/outlook-upload-accounts/batch-delete`、`POST /api/accounts/batch-outlook-auto-auth`。
+
+### Changed
+- Graph 授权更新已有正式账号时，仅覆盖密码与 token 等授权字段，保留原有分组、标签、代理与备注。
+- `POST /api/outlook-upload-accounts` 可接收 `group_id` / `tag_ids` / `proxy_url`；列表序列化同步返回这些字段。
+
+## [2.8.4] - 2026-07-14
+
+### Security
+- 修改登录密码时必须验证当前密码（`current_login_password`），防止已登录会话被冒用改密。
+- 改密成功后轮换登录会话版本：当前改密会话保持有效，其他已登录 Web Session 需重新登录。
+
+### Changed
+- 系统设置弹窗登录密码改为「当前密码 + 新密码」双输入；未填新密码时仍可不修改。
+- `PUT /api/settings` 修改 `login_password` 时同步要求提供正确的 `current_login_password`；扩展登录一次性 token 也会绑定会话版本。
+
+### Fixed
+- 升级前未写入会话版本的旧 Session：仅在尚未发生密码轮换时继续有效，避免误伤；一旦改密则全部失效。
+
+## [2.8.3] - 2026-07-14
+
+### Added
+- Outlook 邮箱授权弹窗新增四种添加 / 授权方式说明：批量导入、🔑 授权并保存、重新授权并刷新，以及当前页自动化授权的入口位置与区别。
+- 说明区提供快捷按钮，可直接跳转到批量导入邮箱或 🔑 授权并保存弹窗。
+
+## [2.8.2] - 2026-07-10
+
+### Changed
+- 账号详情接口 `GET /api/accounts/<id>` 现在直接返回明文 `password` 和 `imap_password` 字段，移除了二次验证流程，前端小眼睛按钮直接在掩码与明文间切换。
+- 移除了 `/api/accounts/<id>/secrets` 二次验证端点及其前端验证弹窗，简化密码查看流程。
+- 账号详情查看时新增 `view_account_detail` 审计日志记录，确保密码字段访问可追溯。
+- OAuth 重新授权弹窗密码字段改为掩码显示+小眼睛切换+点击复制，与编辑账号弹窗密码展示方式一致。
+- 浏览器扩展编辑账号弹窗直接回显已保存的明文密码，移除了"需在 Web 端验证后查看"占位提示。
+- `.secret-reveal-btn` 按钮样式统一为 24×24px 居中对齐，与 Outlook 上传账号密码切换按钮保持一致。
+
+### Fixed
+- 修复重新授权时密码未传入会额外请求账号详情获取密码的回退逻辑。
+
+## [2.8.1] - 2026-07-07
+
+### Added
+- Outlook 自动化授权上传账号表格新增正式账号标签展示，并支持在管理端表格中切换显示/隐藏已保存密码。
+- 新增 Windows `start.bat` / `start.ps1` 本地启动脚本和项目协作说明。
+
+### Changed
+- 手动 OAuth 助手调整为只请求 Outlook IMAP 单资源权限，Graph token fallback 改用独立 Graph scope，避免 Microsoft OAuth v2 跨资源混用报错。
+- 优化 Outlook 自动化授权账号表格的列宽、按钮文案、编辑态和授权操作布局稳定性。
+- 上传账号列表接口会向已登录管理端返回解密后的 `password` 字段，用于前端表格显示切换；新增/修改响应仍不返回明文密码。
+- `SECRET_KEY` 环境变量读取时会忽略首尾空白，并同步 README 配置说明。
+- 清理过时 OAuth 与项目设计文档，保留当前 API 与安全说明。
+
+### Fixed
+- 修复手动 OAuth 授权链接和授权码换 token 请求可能混入 Graph scope 的问题。
+- 修复 Outlook 自动化授权账号表格在标签、密码和操作列下的显示抖动问题。
+
+## [2.8.0] - 2026-07-06
+
+### Added
+- Outlook 自动化授权弹窗支持 `Outlook IMAP` 与 `Graph-only` 双模式授权，并将授权日志内嵌到上传账号管理面板右侧。
+- 上传账号管理支持顶部内联添加、表格行内编辑和已授权账号重新授权入口。
+- 分组面板新增折叠、搜索标题和排序交互优化。
+- README 与 Docker 配置补充本地源码构建运行说明。
+
+### Changed
+- OAuth 授权 Scope 新增 `https://outlook.office.com/IMAP.AccessAsUser.All` 权限，用于让 IMAP 授权模式获取 IMAP 访问能力。
+- Outlook 上传账号列表接口不再返回明文密码，前端列表只显示密码是否已保存。
+- 修改 Outlook 上传账号的邮箱或密码时会将 `is_authorized` 重置为 `0`；仅修改备注不会改变授权状态。
+- Graph 授权模式文案调整为 `Graph-only`，并明确提示不含 IMAP 权限。
+- 优化上传账号表格列宽、按钮显示、授权日志高度与滚动样式。
+
+### Fixed
+- 修复 OAuth 授权后导出的 RefreshToken 无法用于 IMAP 获取邮件的问题（授权时未申请 IMAP 权限）。
+- 修复 Graph OAuth 登录失败检测不稳定的问题。
+- 修复上传账号列表曾可能向前端返回并展示明文密码的问题。
+
+### Security
+- Outlook 上传账号暂存密码继续加密保留在后端，列表 API、前端表格和授权日志均不返回、不展示明文密码。
+
+**重要提示**: 已授权的账号需要重新授权才能获得 IMAP 访问权限；`Graph-only` 模式不含 IMAP 权限，如需 IMAP 访问请选择 `Outlook IMAP` 授权模式。
+
+## [2.7.0] - 2026-07-04
+
+### Added
+- 正式邮箱账号操作菜单新增"加入自动授权"入口，可将已有 Outlook 账号直接加入自动化授权队列；同邮箱重新入队会覆盖暂存密码并重置为未授权状态。
+- 新增 `POST /api/accounts/<account_id>/outlook-auto-auth` 接口和 `upsert_upload_account_for_auto_auth` 数据层 helper，从服务端读取正式账号邮箱和密码写入暂存表，不返回明文密码。
+- Outlook 自动化授权支持重复授权：授权成功后覆盖正式账号的密码、`client_id`、`refresh_token` 和授权更新时间，同时保留分组、备注、别名、标签、代理、转发、排序和启停等业务字段；授权失败时不覆盖已有正式账号数据。
+
+### Changed
+- Graph OAuth 自动提取不再单独定义 `GRAPH_EXTRACT_CLIENT_ID` / `GRAPH_EXTRACT_REDIRECT_URI` 环境变量，改为复用 `01_bootstrap.py` 中的 `OAUTH_CLIENT_ID` / `OAUTH_REDIRECT_URI`；`scope` 和 `authority` 仍为 Graph 自动提取专用，保持独立。
+
+### Security
+- 加入自动授权接口不从响应返回明文密码，密码仅从服务端加密数据读取并加密写入暂存表。
+
+## [2.6.0] - 2026-07-02
+
+### Added
+- 编辑邮箱账号时支持回显和保存账号标签。
+
+### Changed
+- 导入账号的标签选择器改为复用统一的可搜索标签下拉组件。
+
+## [2.5.0] - 2026-06-29
+
+### Added
+- 分享管理改为表格视图，支持按邮箱搜索、按状态筛选、按邮箱/状态/有效期/创建时间排序。
+- 分享管理新增单个删除、批量取消和批量删除能力，对应新增分享删除与批量操作 API。
+- 账号列表标签 pill 新增悬停移除入口，可直接从邮箱账号上移除标签。
+
+### Fixed
+- 临时邮箱列表复用标签摘要时不再显示账号标签移除入口，避免误调用账号标签接口。
+
+## [2.4.0] - 2026-06-29
+
+### Added
+- 账号列表搜索关键字、搜索范围、排序方式和标签筛选现在会保存在浏览器本地，下次打开或切换分组后自动恢复。
+
+### Changed
+- 账号搜索范围默认改为“当前分组”，避免默认跨全部分组搜索造成误判。
+- Outlook 自动化授权列表不再向前端回显上传密码，只展示密码是否存在和掩码长度。
+- Outlook 上传账号模块纳入前端资源哈希，发布后浏览器会自动刷新该模块缓存。
+- 清理旧版 Graph OAuth 对比、实现和 Token 提取迁移文档，保留当前测试指南与 API 文档。
+
+### Fixed
+- 修复 Graph OAuth 登录过程中跟随 localhost 回调重定向导致无法稳定提取授权码的问题。
+- 修复 Docker 构建示例中的在线更新容器名与默认 compose 服务名不一致的问题。
+
+### Security
+- 外部 API 上传的 Outlook 暂存密码改为 Fernet 加密存储，授权成功后清空暂存密码。
+
+## [2.3.2] - 2026-06-28
+
+### Changed
+- 首页和邮箱分享页在没有用户保存主题时默认使用浅色主题，不再跟随系统深色偏好。
+
+## [2.3.1] - 2026-06-28
+
+### Changed
+- 首页 CSS 和 JavaScript 资源 URL 增加内容哈希版本参数，发布后浏览器会自动刷新前端资源缓存。
+- 首页 HTML 响应改为禁止缓存，避免升级后继续加载旧入口页面。
+
+### Fixed
+- 修复内置 Editorial 皮肤使用固定缓存标识导致 CSS 更新后不生效的问题。
+
+## [2.3.0] - 2026-06-28
+
+### Added
+- 新增系统皮肤管理功能，支持通过 API 上传、切换、删除自定义皮肤（CSS 主题），皮肤配置存储在 `data/skins/` 目录下。
+- 新增皮肤管理相关 API 端点：上传皮肤、获取当前皮肤、切换皮肤、删除皮肤、重置为默认皮肤。
+- 新增皮肤示例文件（`docs/skin-example/skin.json`、`docs/skin-example/theme.css`）和皮肤开发文档（`docs/skins.md`）。
+- 新增暗色/亮色主题切换功能，支持系统偏好自动检测和手动切换，状态持久化到 localStorage。
+- 新增账号列表刷新按钮，支持从当前分组标题栏一键刷新账号列表，带旋转动画反馈。
+- 导航栏新增独立的设置按钮、退出按钮和 GitHub 链接图标按钮（桌面端），替换原有的下拉菜单整合布局。
+- 新增 `editorial.css` 皮肤文件，提供 Editorial 风格的排版和配色方案。
+- 浏览器扩展 popup 和 sidepanel 重新设计为暗色主题，引入 Plus Jakarta Sans 字体和渐变按钮风格。
+- 注：如果发现配色很奇怪，请清理下浏览器缓存
+### Changed
+- 导航栏布局重构：GitHub Star 按钮迁移为导航栏图标按钮，操作菜单拆分为桌面端独立图标按钮 + "更多功能"下拉菜单，移动端保留原菜单布局。
+- 邮件列表刷新按钮改为 SVG 图标 + 旋转动画，替换原文字切换显示方式。
+- 分组面板"添加分组"按钮和授权按钮替换为 SVG 图标，统一视觉风格。
+- 账号面板工具栏、邮件列表、模态框、Toast 等组件适配皮肤变量，支持自定义主题覆盖。
+- 设置页新增皮肤管理界面，支持上传、预览、切换和删除皮肤。
+
+### Fixed
+- 修复账号列表刷新按钮在没有选中分组时错误显示的问题，改为仅在选中分组时显示。
+
+## [2.2.0] - 2026-06-27
+
+### Added
+- 邮件转发新增并行执行模式，支持同时扫描多个邮箱账号，可配置并行 worker 数量（1-10）。
+- 转发轮询间隔改为秒级精度（20-3600 秒），替换原分钟级间隔，保留向后兼容。
+- 邮箱分享页面用户 pill 支持点击复制邮箱地址，新增 Toast 提示。
+- 并行模式下自动忽略账号间隔，串行模式下保留原有间隔行为。
+- 转发调度新增 `forwarding_run_lock` 防止并发执行。
+
+### Changed
+- 重构 `process_forwarding_job` 为模块化架构，提取数据库连接、账号解密、任务配置构建、渠道发送等独立函数。
+- 浏览器扩展侧边栏设置页同步适配转发秒级间隔、执行模式、并行 worker 配置。
+- 设置页转发配置 UI 改为秒级间隔输入、执行模式选择、并行 worker 输入，模式切换时自动联动禁用/启用相关控件。
+
+## [2.1.0] - 2026-06-27
+
+### Added
+- 新增邮箱分享功能，支持为单个邮箱账号创建限时或永不过期的只读分享链接。
+- 新增分享管理入口，可查看、复制和取消已创建的邮箱分享链接。
+- 被分享方通过浏览器打开链接后，只能只读查看该邮箱的收件箱和垃圾邮件，支持邮件列表、邮件详情，暂不支持附件信息展示。
+
+### Changed
+- 邮件详情读取逻辑复用为账号级 helper，供登录态页面和匿名分享页面使用。
+
+## [2.0.75] - 2026-06-25
+
+### Fixed
+- 修复 Cloudflare 自动导入邮箱的流式进度请求在生产环境中丢失 Flask 应用上下文后返回 500 的问题。
+
+## [2.0.74] - 2026-06-25
+
+### Added
+- 邮箱账号面板新增极简展示模式，可隐藏备注、标签、刷新状态等辅助信息以提升列表密度。
+- 桌面端分组栏新增折叠/展开控制，并记住用户上次选择的折叠状态。
+
+### Changed
+- 优化账号面板工具按钮图标展示，替换部分 emoji 按钮为一致的 SVG 图标。
+
+### Fixed
+- 修复未匹配路由等 HTTP 异常被全局异常处理器错误转换为 500 的问题，保留原始 HTTP 状态码。
+
+## [2.0.73] - 2026-06-25
+
+### Added
+- Cloudflare 临时邮箱导入支持自动识别并兼容旧格式 `邮箱----JWT`，自动提取邮箱部分，无需手动修改旧导出文件。
+- Cloudflare 渠道设置新增"测试连接"功能，支持一键测试域名列表、地址列表和邮件列表三项管理员 API，并展示详细测试结果。
+- 新增Cloudflare 自动导入邮箱功能，支持实时进度显示，使用 Server-Sent Events 流式推送导入进度、百分比和统计信息。
+
+### Changed
+- 自动导入大数据量时在界面实时显示：已导入数量/总数量 (百分比) - 新增、更新、跳过统计。
+- 优化 Cloudflare 导入用户体验，提供平滑的旧格式迁移路径和可见的导入进度。
+
+## [2.0.72] - 2026-06-19
+
+### Changed
+- 临时邮箱生成弹窗改为 Cloudflare、GPTMail、DuckMail 分段切换布局，并优化 Cloudflare 渠道、域名、数量、用户名生成方式和标签绑定控件。
+- 设置页临时邮箱配置顺序调整为 Cloudflare、GPTMail、DuckMail，并同步侧边导航与前端测试契约。
+
+### Added
+- DuckMail 临时邮箱创建表单新增密码显示/隐藏按钮。
+
+## [2.0.71] - 2026-06-19
+
+### Added
+- Cloudflare 临时邮箱新增批量生成入口，支持按数量创建、部分失败明细和为成功创建的邮箱自动绑定标签。
+- Cloudflare 临时邮箱新增 AI 用户名生成配置，支持 OpenAI-compatible API、保存前测试生成，以及在生成弹窗中显式生成并编辑用户名列表。
+
+### Changed
+- Cloudflare 临时邮箱生成弹窗改为多行用户名输入，一行一个；提交创建时只使用显式用户名列表或随机用户名，不再在创建阶段隐式调用 AI。
+- Cloudflare 临时邮箱导入保留标签选择，并在界面示例中展示 `[cloudflare:<channel_name>]` 分段和 `邮箱----JWT----渠道名` 写法。
+
+### Fixed
+- 修复设置页同一分区包含多个面板时桌面布局错位的问题。
+
+## [2.0.70] - 2026-06-18
+
+### Added
+- 分组管理新增最多三级的树形层级，支持创建、编辑、折叠展开、同级排序和跨层级拖拽移动分组。
+- 添加/编辑分组弹窗新增父分组选择，分组下拉、批量移动、导出选择和浏览器扩展导出均适配树形展示。
+
+### Changed
+- 选中分组时，账号列表、账号搜索、分组导出、全部分组导出和项目分组范围会包含该分组及其所有子分组账号。
+- 子分组未配置代理时会向上继承父级分组代理；账号级代理仍优先于分组代理。
+- 删除含子分组的分组时会级联删除子分组，并将所有相关账号移回默认分组。
+
+### Fixed
+- 外部 API 的 `group_id` 账号筛选保持直接分组语义，避免树形分组升级后改变既有对外 API 范围。
+- 分组导出在同时选择父子分组时会去重账号，避免重复导出子分组账号。
+
+## [2.0.69] - 2026-06-15
+
+### Fixed
+- 修复 Microsoft Graph 附件元数据查询因选择不支持的 `contentId` 字段导致附件列表获取失败的问题。
+- 修复 Graph 邮件详情在附件元数据为空时丢失 `has_attachments` 标记的问题，确保本地保留缓存能识别附件元数据不完整并回源补齐。
+- 修复普通邮箱详情请求未稳定携带 `id_mode` 的问题，避免 Graph、UID 和 sequence 消息 ID 语义混用导致详情或附件读取失败。
+
+## [2.0.68] - 2026-06-14
+
+### Fixed
+- 修复普通邮箱本地保留详情在缓存标记有附件但附件元数据为空时直接返回本地缓存，导致邮件详情不展示附件的问题；现在会回退远程详情补齐附件元数据并回填本地缓存。
+
+## [2.0.67] - 2026-06-08
+
+### Added
+- Token 刷新管理邮箱列表新增分页控件，支持切换每页 100 到 10000 项、上一页/下一页和页码跳转，并记住用户选择的每页数量。
+
+### Changed
+- `/api/accounts/refresh-status-list` 的 `page_size` 上限从 500 提升到 10000，前端列表摘要改为显示当前页项目范围。
+
+## [2.0.66] - 2026-06-08
+
+### Added
+- Token 刷新管理邮箱列表完整移植普通邮箱列表批量操作，支持选择模式、行点击、`Shift` 连选、拖拽选择，以及刷新 Token、复制邮箱+别名、导出、转发开关、代理、标签、移动分组和删除。
+
+### Changed
+- Token 刷新管理中的批量账号变更会同步刷新 Token 列表、主邮箱账号列表、分组计数和相关前端缓存，避免两个列表状态不一致。
+
+## [2.0.65] - 2026-06-07
+
+### Added
+- Outlook OAuth 账号新增重新授权入口，支持从编辑账号弹窗和刷新失败提示中更新已有账号授权并自动触发单账号刷新验证。
+- 新增 `POST /api/accounts/<account_id>/reauthorize` 接口，只更新已有账号授权字段并保留邮箱、密码、分组、代理、标签等业务信息。
+
+### Fixed
+- 重新授权保存新授权信息后先提交数据库事务，再执行自动刷新验证，避免外部刷新请求期间持有 SQLite 写锁。
+
+## [2.0.64] - 2026-06-07
+
+### Added
+- Cloudflare Temp Email 新增多渠道管理，支持为多套 Worker、管理员密码和独立邮件池分别配置渠道。
+- 设置页新增 Cloudflare 渠道列表与创建、编辑、启用/停用、删除能力，并展示渠道引用数量。
+- Cloudflare 临时邮箱创建、读信、删除和全部邮件视图支持按渠道执行；全部邮件入口按渠道独立展示。
+- Cloudflare 临时邮箱导入导出支持 `[cloudflare:<channel_name>]` 分段格式，旧格式继续落到默认渠道。
+
+### Changed
+- 旧单渠道 Cloudflare 配置会在启动时迁移为默认渠道，已有 Cloudflare 临时邮箱会自动绑定默认渠道。
+- Cloudflare 渠道邮箱域名改为可选；未配置域名时渠道仍可保存，域名查询返回空列表。
+- `/api/cloudflare/messages` 未传 `channel_id` 时改为使用默认 Cloudflare 渠道。
+- Cloudflare 渠道名按大小写不敏感规则保持唯一，旧大小写冲突数据会在迁移时自动重命名后出现的重复项。
+
+### Fixed
+- 修复 Cloudflare 渠道表单“新建渠道”按钮实际只清空表单导致误操作的问题。
+- 修复 Cloudflare 全部邮件入口重复展示渠道名的问题。
+
+## [2.0.63] - 2026-06-04
+
+### Added
+- 新版本提示弹框改为在检测到远端新版本时展示，并显示最近 3 次更新记录。
+- 新版本弹框新增“前往下载”和 Docker 在线更新入口；未启用 Docker 在线更新时保留配置说明。
+
+### Changed
+- 版本状态接口新增远端更新说明解析，优先从远端 `CHANGELOG.md` 提取最近 3 个版本小节，并保留原有 `release_notes.items` 兼容字段。
+- 新版本提示按远端最新版本去重，不再在用户已经更新后按当前运行版本弹出。
+
+## [2.0.62] - 2026-06-04
+
+### Changed
+- 重构编辑邮箱账号弹窗布局，将基础信息、认证信息、代理设置、备注与别名分区展示，减少长表单滚动。
+- 编辑账号弹窗在桌面端改为更宽的紧凑两列布局，并在移动端自动回退为单列。
+- 别名提示文案改为“API 可用别名查询”，避免误解为仅对外 API 支持别名。
+
+## [2.0.61] - 2026-06-04
+
+### Added
+- 账号编辑页新增账号密码和 IMAP 密码展示二次验证，已保存密码默认隐藏，仅在输入当前登录密码后显示。
+
+### Changed
+- `GET /api/accounts/<id>` 不再返回账号密码和 IMAP 密码明文，只返回 `has_password` / `has_imap_password` 标记；查看密码必须调用 `/api/accounts/<id>/secrets` 并完成登录密码二次验证。
+- Web 端账号密码展示入口改为输入框内的小眼睛按钮，验证弹窗会覆盖在编辑弹窗上方，验证后可直接在原编辑弹窗查看密码。
+- 浏览器扩展账号编辑页适配密码隐藏逻辑，未填写密码时保留已保存密码。
+
+### Fixed
+- 修复账号编辑时省略 `password` 或 `imap_password` 字段会清空已保存密码的问题。
+
 ## [2.0.60] - 2026-06-01
 
 ### Fixed

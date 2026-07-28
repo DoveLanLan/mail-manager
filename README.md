@@ -1,11 +1,13 @@
 # 多邮箱邮件管理工具
 
 一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面、Chrome/Edge 浏览器扩展，用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
+
+注意：改密码会导致auth失效，需要重新授权
 ## 📦 快速开始
 ### 体验站点（可能非最新版本）
 https://aso.de5.net
 admin123
-注意：体验站点请勿修改密码或存放实际数据，部署在无持久化的服务上，数据随时可能丢失恢复初始状态
+注意：体验站点请勿修改密码或存放实际数据，部署在无持久化的服务上，数据随时可能丢失恢复初始状态；并且由于大家都能登录看到，并且好像有进程在扫描，所以非常可能存在账号被盗的风险
 
 ## 🌿 版本管理与发布
 
@@ -70,6 +72,8 @@ pip install -r requirements.txt
 export SECRET_KEY=your-secret-key-here
 python web_outlook_app.py
 ```
+
+python -m pip install -r requirements.txt; $env:SECRET_KEY = (& python -c "import secrets; print(secrets.token_hex(32))")[0]; $env:HOST="127.0.0.1"; python web_outlook_app.py
 
 访问 `http://localhost:5000` 即可使用。
 如果是服务器部署，仍然建议显式设置固定 `SECRET_KEY`。
@@ -137,6 +141,62 @@ services:
     restart: unless-stopped
 ```
 
+### 方式五：本地源码构建并运行（docker-compose.build.yml）
+
+适合在本机基于源码自行构建镜像（而非拉取 `ghcr.io` 上的预构建镜像）后运行，便于本地改动后立即验证。
+
+仓库根目录已提供 `docker-compose.build.yml`，它会用根目录的 `Dockerfile` 从源码构建镜像并启动容器。
+
+#### 步骤 1：准备环境变量文件 `.env.local`
+
+`docker-compose.build.yml` 通过 `env_file: .env.local` 注入环境变量，该文件**不存在时 Compose 会直接报错拒绝启动**，需先从模板复制并修改：
+
+```bash
+cp .env.example .env.local
+```
+
+至少修改以下两项：
+
+```bash
+# 生成随机串后填入 .env.local 的 SECRET_KEY
+python -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+- `SECRET_KEY`：填入上面生成的随机串（务必修改，勿用占位值；首尾空白会被忽略）
+- `LOGIN_PASSWORD`：首次初始化时的登录密码，默认 `admin123`，建议改为强密码；**已写入数据库后**再改此变量不会覆盖当前密码。忘记密码请用 `scripts/reset_login_password.py`（见 [故障排除](docs/troubleshooting.md) / [安全配置](docs/security.md)）
+
+可选：如需调整 Gunicorn 线程数 / 超时，在 `.env.local` 中追加 `GUNICORN_THREADS`、`GUNICORN_TIMEOUT`（不填则使用默认值 4 / 300）。
+
+#### 步骤 2：构建并启动
+
+```bash
+docker compose -f docker-compose.build.yml up -d --build
+```
+
+- `--build` 强制从源码重新构建镜像（镜像标签为 `outlookemail:local`）
+- 容器名为 `outlook-mail`，映射端口 `5000:5000`
+- 数据持久化在宿主机 `./data`；`./static`、`./templates` 以只读方式挂载，便于本地编辑模板/静态资源实时生效
+
+启动后访问 `http://localhost:5000`，使用 `.env.local` 中的 `LOGIN_PASSWORD` 登录。
+
+#### 步骤 3：常用运维命令
+
+```bash
+# 查看日志
+docker compose -f docker-compose.build.yml logs -f
+
+# 查看健康检查与状态
+docker compose -f docker-compose.build.yml ps
+
+# 改动源码后重新构建并重启
+docker compose -f docker-compose.build.yml up -d --build
+
+# 停止并移除容器（数据仍保留在 ./data）
+docker compose -f docker-compose.build.yml down
+```
+
+> 提示：`docker-compose.build.yml` 默认未挂载宿主机 Docker socket，因此界面里的「Docker 在线更新」不可用——本地构建场景请直接用上面的 `up -d --build` 重新构建来更新。
+
 ## ✨ 功能特性
 
 ### 邮件读取方式
@@ -164,28 +224,29 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 ### Web 应用功能
 
 #### 核心功能
-- 🔐 **登录验证** - 密码保护的 Web 界面，支持在线修改密码
-- 📁 **分组管理** - 支持创建、编辑、删除邮箱分组，自定义分组颜色，支持分组级别代理设置
-- 🌐 **账号/分组代理** - 每个分组可配置 HTTP/SOCKS5 代理，单个账号也可设置代理并优先覆盖分组代理
+- 🔐 **登录验证** - 密码保护的 Web 界面，支持在线修改密码；忘记密码可用官方脚本 `scripts/reset_login_password.py` 重置（见 [故障排除](docs/troubleshooting.md)）
+- 📁 **分组管理** - 支持最多三级树形邮箱分组，创建、编辑、折叠展开、同级排序、跨层级拖拽移动和级联删除
+- 🌐 **账号/分组代理** - 每个分组可配置 HTTP/SOCKS5 代理，子分组可继承父级代理，单个账号也可设置代理并优先覆盖分组代理；代理 URL 支持 `{mail}` 占位符（对接 [Resin](https://github.com/Resinat/Resin) 等粘性代理池）
 - 📧 **多邮箱管理** - 批量导入和管理 Outlook/Hotmail OAuth / IMAP 邮箱账号
 - 🪪 **别名管理** - 支持给单个邮箱配置多个别名邮箱，主邮箱和别名都可用于检索邮件和调用对外 API
 - 🔀 **别名高级用法** - 可将外部邮箱自动转发到本项目管理的邮箱 A，再把外部邮箱配置为 A 的别名，从而通过本项目统一读取邮件
 - 📬 **邮件查看** - Web 界面支持查看收件箱和垃圾邮件；API 支持 `inbox`、`junkemail`、`deleteditems`、`all`
 - 📎 **附件下载** - 邮件详情支持单个附件下载，也支持将全部附件打包为 ZIP 下载
 - 🔍 **全屏查看** - 支持全屏模式查看邮件
-- 📤 **导出功能** - 支持按分组或全部导出邮箱账号信息
+- 📤 **导出功能** - 支持按分组树、选中账号或全部导出邮箱账号信息
 - 🧩 **WebDAV 备份** - 支持将“导出全部分组”的文件按 Cron 定时上传到 WebDAV，也可手动上传
 - 🎨 **现代化 UI** - 四栏布局，账号列表、邮件列表、邮件详情分区清晰
+- 🎭 **系统级外观皮肤** - 支持内置 classic、自定义 zip 皮肤包和 Git 仓库来源；切换后所有登录设备一致
 - ⚡ **性能优化** - 邮件列表与账号列表缓存，分组切换和账号切换更快
 - 📄 **分页加载** - 滚动到底部自动加载下一页（每页20封）
-- 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取、查看详情，并支持 Cloudflare 全部邮件视图
+- 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取、查看详情；Cloudflare 支持多渠道配置，每个 Worker/管理员密码/邮件池独立管理，并按渠道查看全部邮件
 - ⚙️ **系统设置** - 在线修改密码、API Key 等
 - 🔄 **OAuth2 助手** - 内置授权流程，快速获取 Refresh Token
 - 💾 **邮件缓存** - 智能缓存邮件列表，切换即时展示；普通邮箱本地保留默认关闭，可在设置页开启、查看统计并清理本地保留缓存
 - 🏷️ **标签管理** - 支持给邮箱打标签、批量操作、按标签筛选
-- 📦 **批量移动分组** - 批量选择邮箱移动到指定分组
+- 📦 **批量移动分组** - 批量选择邮箱移动到任意普通分组层级
 - ✅ **批量选择** - 邮箱列表、邮件列表均支持全选当前列表与清空选择
-- 🗑️ **邮件删除** - 单封/批量永久删除邮件
+- 🗑️ **邮件删除** - 单封/批量永久删除；Graph 与 IMAP（含标准 IMAP 账号、OAuth IMAP 回退）均支持
 - 🔄 **API 优先级回退** - Graph API → IMAP(新) → IMAP(旧) 自动回退
 - 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需登录，支持别名邮箱、聚合文件夹和多条件筛选 带+号的附加电子邮箱自动识别，自动回退主邮箱/别名邮箱查询；如果要求的功能比较完善，建议直接对接完整API，文档已经改成了适合AI读取的形状，直接喂给AI让AI按照完整API使用登录密码而不是API Key对接即可
 
@@ -199,6 +260,8 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 
 #### Token 刷新管理
 - 🔁 **全量刷新** - 一键刷新所有 Outlook/Hotmail OAuth 账号 Token
+- ✅ **完整批量操作** - 在 Token 刷新管理列表中可直接批量刷新、复制、导出、转发、代理、打标签、移动分组和删除账号
+- 📄 **分页浏览** - Token 刷新管理列表支持页码跳转和每页数量切换，适合大量账号场景
 - ⏰ **定时刷新** - 支持按天数或 Cron 表达式配置，Docker / Docker Compose 启动也会自动生效
 - 📊 **刷新统计** - 实时显示失败邮箱数量
 - 📜 **刷新历史** - 近半年完整记录
@@ -215,8 +278,8 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 ### 界面布局
 
 Web 应用采用四栏式布局设计：
-1. **分组面板** - 显示所有邮箱分组，点击切换
-2. **邮箱面板** - 显示当前分组下的邮箱账号列表
+1. **分组面板** - 以最多三级树形结构显示所有邮箱分组，点击切换，选中父分组时包含子分组账号
+2. **邮箱面板** - 显示当前分组及其子分组下的邮箱账号列表
 3. **邮件列表** - 显示选中邮箱的邮件，支持切换文件夹和滚动加载
 4. **邮件详情** - 显示选中邮件的完整内容（支持 HTML 渲染）
 
@@ -272,12 +335,12 @@ Web 应用采用四栏式布局设计：
 
 #### 步骤 4：配置 API 权限  这一步应该可以省略，目前内置的客户端id就没有设置这一步也能正常使用
 
-在「API 权限」中添加以下权限：
+手动 OAuth 助手默认走 GraphAPI 单资源权限，避免 Microsoft OAuth v2 在同一次授权中混用 Graph 和 Outlook 资源时报 `AADSTS70011`：
 - `offline_access` - 获取刷新令牌
-- `Mail.Read` - 读取邮件
-- `Mail.ReadWrite` - 读写邮件
-- `User.Read` - 读取用户信息
-- `IMAP.AccessAsUser.All` - IMAP 访问
+- `Mail.Read` / `Mail.ReadWrite` / `User.Read` - Graph 读信、标已读与基本用户信息
+
+如需 IMAP 访问，请在「Outlook邮箱授权」面板选择 `IMAP授权`（自动授权默认是 GraphAPI），不要和 Graph 权限放在同一次手动授权链接里。
+
 #### 步骤 5：获取 Refresh Token
 
 使用本工具内置的 OAuth2 助手获取 Refresh Token：
@@ -344,6 +407,33 @@ user@example.com----app-password----imap.example.com----993
 
 支持批量导入，每行一个账号。导入文件格式保持不变；导入弹窗可为本次新增账号统一设置备注、标签、状态，并可选择是否立即开启邮件转发。普通邮箱导入时不能选择临时邮箱分组。
 
+分组支持最多三级层级。选中父分组时，邮箱账号列表会同时展示该分组和所有子分组下的账号；子分组未配置代理时会向上继承父级分组代理。删除含子分组的分组会级联删除子分组，并把相关账号移回默认分组。
+
+#### 代理与 Resin `{mail}` 模板
+
+分组或账号代理 URL 可包含字面量 `{mail}`。出站请求（拉信、Token 刷新、Outlook 自动授权等）会在运行时替换为邮箱 `@` 前 local-part：去掉非字母数字字符并转小写。配置原样存库，编辑回显不展开。
+
+推荐示例（Resin 默认端口 2260，V1 粘性身份 `Platform.Account:TOKEN`）：
+
+```text
+socks5h://outlook.{mail}:你的Token@127.0.0.1:2260
+```
+
+Token 为空时以下两种均可：
+
+```text
+socks5h://outlook.{mail}:@127.0.0.1:2260
+socks5h://outlook.{mail}@127.0.0.1:2260
+```
+
+说明：
+
+- 建议优先 `socks5h://` / `socks5://`；普通 HTTP 代理对 IMAP 令牌请求可能不可用
+- 不同邮箱前缀净化后可能碰撞（如 `a.b` 与 `ab`），本项目接受该行为
+- 上传账号自动授权：优先用上传记录自己的 `proxy_url`，否则继承分组代理模板
+- 默认 `LOG_LEVEL=INFO` 会在拉信 / Token 刷新 / 自动授权时打印 `[代理]` 详情（密码打码）。批量场景日志较多时，设 `LOG_LEVEL=WARNING` 即可降噪关闭这类 INFO
+- 友情项目：[Resin](https://github.com/Resinat/Resin)
+
 ### 3. 查看邮件
 
 1. 从左侧选择分组
@@ -385,6 +475,23 @@ user@example.com----app-password----imap.example.com----993
 - **删除**：永久删除选中账号，操作前会再次确认。
 
 临时邮箱分组也使用同一套选择方式，但批量菜单只显示适用于临时邮箱的操作，例如复制邮箱、标签添加/移除和删除；刷新 Token、转发开关、移动分组等普通账号专属操作会隐藏。
+
+按分组导出时会包含所选分组及其所有子分组账号；如果同时选中了父分组和子分组，导出内容会自动去重。
+
+#### Token 刷新管理列表
+
+「Token刷新管理」里的邮箱列表也支持同一套批量选择方式：
+
+1. 点击列表头部的「☑」进入批量选择模式。
+2. 通过复选框、账号行点击、`Shift` 连续范围选择或拖拽选择账号。
+3. 点击「全选当前列表」只选中当前筛选后已经显示的账号。
+4. 搜索关键词或切换状态筛选时，已选账号会清空，避免误操作筛选外账号。
+
+选中账号后可直接执行这些批量动作：
+
+- **刷新 Token**：继续使用 Token 刷新管理的流式任务日志，可查看账号级进度和结果。
+- **复制邮箱+别名 / 导出**：复用普通邮箱列表的复制和二次验证导出流程。
+- **开启转发 / 取消转发 / 代理 / 标签+ / 标签- / 移动 / 删除**：复用普通邮箱账号批量接口，完成后会同步刷新 Token 刷新管理列表、主邮箱列表和分组计数。
 
 #### 邮件列表
 
@@ -516,6 +623,7 @@ curl -H "X-API-Key: your-api-key" \
 | [🚀 部署指南](docs/deployment.md) | Docker、Docker Compose、Nginx/Caddy 部署、环境变量配置 |
 | [⬆️ 升级指南](docs/upgrade.md) | Windows、Docker、Python 直跑升级与回滚建议 |
 | [🔐 安全配置](docs/security.md) | XSS/CSRF 防护、数据加密、速率限制、审计日志 |
+| [🎭 外观皮肤](docs/skins.md) | 系统级皮肤、zip 上传、Git 仓库来源、皮肤包格式与持久化说明 |
 | [📡 API 文档](docs/api.md) | 对外简易API、完整API、代理配置 |
 | [🛠️ 故障排查](docs/troubleshooting.md) | 常见问题、故障排查步骤 |
 | [📋 更新日志](CHANGELOG.md) | 版本更新历史 |
@@ -607,6 +715,7 @@ MIT License - 详见 [LICENSE](LICENSE)
 - [Microsoft Graph API](https://docs.microsoft.com/graph/)
 - [GPTMail](https://mail.chatgpt.org.uk)
 - [Flask](https://flask.palletsprojects.com/)
+- [Resin](https://github.com/Resinat/Resin) — 高性能粘性代理池网关
 
 ## ⭐ Star History
 

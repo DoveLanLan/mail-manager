@@ -1,4 +1,4 @@
-        /* global accountsCache, applyEmailListCache, closeMobilePanels, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentGroupId, currentMethod, currentSkip, emailListCache, getEmailListCacheEntry, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, hideModal, isTempEmailGroup, loadAccountsByGroup, loadEmails, loadGroups, renderEmailList, scheduleEmailListLoadCheck, setModalVisible, showEmailList, showToast, updateImportHint, updateMobileContext */
+        /* global accountsCache, applyEmailListCache, closeMobilePanels, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentGroupId, currentMethod, currentSkip, emailListCache, getEmailListCacheEntry, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, hideModal, isTempEmailGroup, loadAccountsByGroup, loadEmails, loadGroups, renderEmailList, scheduleEmailListLoadCheck, showEmailList, showToast, updateMobileContext */
 
         // ==================== 账号相关 ====================
 
@@ -65,161 +65,18 @@
             }
         }
 
-        // 显示添加账号模态框
-        function showAddAccountModalLegacy() {
-            document.getElementById('accountInput').value = '';
-            // 设置默认分组为当前选中的分组
-            if (currentGroupId) {
-                document.getElementById('importGroupSelect').value = currentGroupId;
-            }
-            updateImportHint();
-            setModalVisible('addAccountModal', true);
-        }
-
         // 隐藏添加账号模态框
         function hideAddAccountModal() {
             hideModal('addAccountModal');
         }
 
-        // 添加账号
-        async function addAccountLegacy() {
-            const input = document.getElementById('accountInput').value.trim();
-            const groupId = parseInt(document.getElementById('importGroupSelect').value);
-
-            if (!input) {
-                showToast('请输入账号信息', 'error');
-                return;
-            }
-
-            // 检查是否是临时邮箱分组
-            const selectedGroup = groups.find(g => g.id === groupId);
-            const isTempGroup = selectedGroup && selectedGroup.name === '临时邮箱';
-
-            try {
-                let response;
-                if (isTempGroup) {
-                    // 临时邮箱导入使用专用 API，传入选中的渠道
-                    const provider = document.getElementById('importChannelSelect').value || 'gptmail';
-                    response = await fetch('/api/temp-emails/import', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ account_string: input, provider: provider })
-                    });
-                } else {
-                    response = await fetch('/api/accounts', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ account_string: input, group_id: groupId })
-                    });
-                }
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(data.message, 'success');
-                    hideAddAccountModal();
-
-                    // 清除该分组的缓存
-                    delete accountsCache[groupId];
-
-                    // 刷新分组列表（更新数量）
-                    await loadGroups();
-
-                    // 刷新邮箱列表
-                    if (isTempGroup) {
-                        await loadTempEmails(true);
-                    } else {
-                        await loadAccountsByGroup(groupId, true);
-                    }
-                } else {
-                    handleApiError(data, '导入失败');
-                }
-            } catch (error) {
-                showToast('导入失败', 'error');
-            }
-        }
-
-        // 显示编辑账号模态框
-        async function showEditAccountModalLegacy(accountId) {
-            try {
-                const response = await fetch(`/api/accounts/${accountId}`);
-                const data = await response.json();
-
-                if (data.success) {
-                    const acc = data.account;
-                    document.getElementById('editAccountId').value = acc.id;
-                    document.getElementById('editEmail').value = acc.email;
-                    document.getElementById('editPassword').value = acc.password || '';
-                    document.getElementById('editClientId').value = acc.client_id;
-                    document.getElementById('editRefreshToken').value = acc.refresh_token;
-                    document.getElementById('editGroupSelect').value = acc.group_id || 1;
-                    document.getElementById('editRemark').value = acc.remark || '';
-                    document.getElementById('editStatus').value = acc.status || 'active';
-                    setModalVisible('editAccountModal', true);
-                }
-            } catch (error) {
-                showToast('加载账号信息失败', 'error');
-            }
-        }
-
         // 隐藏编辑账号模态框
         function hideEditAccountModal() {
+            if (typeof clearEditAccountSecrets === 'function') {
+                clearEditAccountSecrets();
+            }
+            document.getElementById('editTagFilterDropdown')?.classList.remove('open');
             hideModal('editAccountModal');
-        }
-
-        // 更新账号
-        async function updateAccountLegacy() {
-            const accountId = document.getElementById('editAccountId').value;
-            const oldGroupId = currentGroupId;
-            const newGroupId = parseInt(document.getElementById('editGroupSelect').value);
-
-            const data = {
-                email: document.getElementById('editEmail').value.trim(),
-                password: document.getElementById('editPassword').value,
-                client_id: document.getElementById('editClientId').value.trim(),
-                refresh_token: document.getElementById('editRefreshToken').value.trim(),
-                group_id: newGroupId,
-                remark: document.getElementById('editRemark').value.trim(),
-                status: document.getElementById('editStatus').value
-            };
-
-            if (!data.email || !data.client_id || !data.refresh_token) {
-                showToast('邮箱、Client ID 和 Refresh Token 不能为空', 'error');
-                return;
-            }
-
-            try {
-                const response = await fetch(`/api/accounts/${accountId}`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    showToast(result.message, 'success');
-                    hideEditAccountModal();
-
-                    // 清除相关分组的缓存
-                    delete accountsCache[oldGroupId];
-                    if (oldGroupId !== newGroupId) {
-                        delete accountsCache[newGroupId];
-                    }
-
-                    // 刷新分组列表
-                    loadGroups();
-
-                    // 刷新当前分组的邮箱列表
-                    if (currentGroupId) {
-                        loadAccountsByGroup(currentGroupId, true);
-                    }
-                } else {
-                    showToast(result.error, 'error');
-                }
-            } catch (error) {
-                showToast('更新失败', 'error');
-            }
         }
 
         // 删除当前编辑的账号
@@ -350,21 +207,36 @@
                 if (groups.length === 0) {
                     container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">暂无分组</div>';
                 } else {
-                    container.innerHTML = groups.map(group => `
-                        <label style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; border-radius: 6px; transition: background-color 0.15s;"
-                               onmouseover="this.style.backgroundColor='#f5f5f5'"
-                               onmouseout="this.style.backgroundColor='transparent'">
-                            <input type="checkbox" class="export-group-checkbox" value="${group.id}" style="width: 16px; height: 16px;">
-                            <span style="display: flex; align-items: center; gap: 8px; flex: 1;">
-                                <span style="width: 12px; height: 12px; border-radius: 3px; background-color: ${group.color || '#666'}"></span>
-                                <span style="display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex: 1;">
-                                    <span style="font-size: 14px; color: #1a1a1a; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(normalizeGroupName(group.name))}</span>
-                                    ${formatGroupIdBadgeText(group.id) ? `<span class="group-id-badge">${escapeHtml(formatGroupIdBadgeText(group.id))}</span>` : ''}
+                    const sortedGroups = typeof flattenGroupTree === 'function' && typeof buildGroupTree === 'function'
+                        ? flattenGroupTree(buildGroupTree(groups))
+                        : groups;
+
+                    container.innerHTML = sortedGroups.map(group => {
+                        const level = typeof normalizeGroupLevel === 'function' ? normalizeGroupLevel(group) : 1;
+                        const paddingLeft = 12 + (level - 1) * 16;
+                        const count = group.descendant_account_count ?? group.account_count ?? 0;
+                        return `
+                            <label style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; padding-left: ${paddingLeft}px; cursor: pointer; border-radius: 6px; transition: background-color 0.15s, opacity 0.15s;"
+                                   onmouseover="this.style.backgroundColor='#f5f5f5'"
+                                   onmouseout="this.style.backgroundColor='transparent'">
+                                <input type="checkbox" class="export-group-checkbox" value="${group.id}" style="width: 16px; height: 16px;">
+                                <span style="display: flex; align-items: center; gap: 8px; flex: 1;">
+                                    <span style="width: 12px; height: 12px; border-radius: 3px; background-color: ${group.color || '#666'}"></span>
+                                    <span style="display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex: 1;">
+                                        <span style="font-size: 14px; color: #1a1a1a; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(normalizeGroupName(group.name))}</span>
+                                        ${formatGroupIdBadgeText(group.id) ? `<span class="group-id-badge">${escapeHtml(formatGroupIdBadgeText(group.id))}</span>` : ''}
+                                    </span>
                                 </span>
-                            </span>
-                            <span style="font-size: 12px; color: #999; background-color: #f0f0f0; padding: 2px 8px; border-radius: 10px;">${group.account_count || 0}</span>
-                        </label>
-                    `).join('');
+                                <span style="font-size: 12px; color: #999; background-color: #f0f0f0; padding: 2px 8px; border-radius: 10px;">${count || 0}</span>
+                            </label>
+                        `;
+                    }).join('');
+
+                    // 绑定复选框变化事件
+                    document.querySelectorAll('.export-group-checkbox').forEach(cb => {
+                        cb.addEventListener('change', handleExportCheckboxChange);
+                    });
+                    syncExportGroupCheckboxStates();
                 }
             } catch (error) {
                 container.innerHTML = '<div style="padding: 20px; text-align: center; color: #dc3545;">加载失败</div>';
@@ -374,12 +246,78 @@
             document.getElementById('selectAllGroups').checked = false;
         }
 
+        // 获取下级分组的 ID 列表
+        function getDescendantGroupIds(groupId) {
+            const descendants = [];
+            const queue = [Number(groupId)];
+            while (queue.length > 0) {
+                const currentId = queue.shift();
+                groups.forEach(g => {
+                    if (g.parent_id && Number(g.parent_id) === currentId) {
+                        descendants.push(g.id);
+                        queue.push(g.id);
+                    }
+                });
+            }
+            return descendants;
+        }
+
+        function hasSelectedAncestorGroup(groupId, selectedGroupIds) {
+            let current = groups.find(g => Number(g.id) === Number(groupId));
+            while (current && current.parent_id) {
+                const parentId = Number(current.parent_id);
+                if (selectedGroupIds.has(parentId)) {
+                    return true;
+                }
+                current = groups.find(g => Number(g.id) === parentId);
+            }
+            return false;
+        }
+
+        function syncExportGroupCheckboxStates() {
+            const checkboxes = Array.from(document.querySelectorAll('.export-group-checkbox'));
+            const selectedGroupIds = new Set(checkboxes
+                .filter(cb => cb.checked)
+                .map(cb => Number(cb.value)));
+
+            checkboxes.forEach(cb => {
+                const coveredByParent = hasSelectedAncestorGroup(Number(cb.value), selectedGroupIds);
+                cb.disabled = coveredByParent;
+                if (coveredByParent) {
+                    cb.checked = true;
+                }
+                const row = cb.closest('label');
+                if (row) {
+                    row.style.opacity = coveredByParent ? '0.45' : '';
+                    row.style.cursor = coveredByParent ? 'default' : 'pointer';
+                }
+            });
+        }
+
+        // 处理导出复选框变化
+        function handleExportCheckboxChange(event) {
+            const cb = event.target;
+            if (!cb) return;
+            const groupId = Number(cb.value);
+            const isChecked = cb.checked;
+
+            const descendants = getDescendantGroupIds(groupId);
+            descendants.forEach(descId => {
+                const descCb = document.querySelector(`.export-group-checkbox[value="${descId}"]`);
+                if (descCb) {
+                    descCb.checked = isChecked;
+                }
+            });
+            syncExportGroupCheckboxStates();
+        }
+
         // 全选/取消全选分组
         function toggleSelectAllGroups() {
             const selectAll = document.getElementById('selectAllGroups').checked;
             document.querySelectorAll('.export-group-checkbox').forEach(cb => {
                 cb.checked = selectAll;
             });
+            syncExportGroupCheckboxStates();
         }
 
         // 存储待导出的分组或账号 ID
@@ -388,8 +326,20 @@
 
         // 导出选中的分组
         async function exportSelectedGroups() {
-            const checkboxes = document.querySelectorAll('.export-group-checkbox:checked');
-            const groupIds = Array.from(checkboxes).map(cb => parseInt(cb.value));
+            const checkboxes = Array.from(document.querySelectorAll('.export-group-checkbox:checked'));
+            const selectedGroupIds = checkboxes.map(cb => parseInt(cb.value));
+
+            // 过滤掉其父分组也同时被选中的子分组，避免重复导出
+            const groupIds = selectedGroupIds.filter(groupId => {
+                let current = groups.find(g => Number(g.id) === Number(groupId));
+                while (current && current.parent_id) {
+                    if (selectedGroupIds.includes(Number(current.parent_id))) {
+                        return false;
+                    }
+                    current = groups.find(g => Number(g.id) === Number(current.parent_id));
+                }
+                return true;
+            });
 
             if (groupIds.length === 0) {
                 showToast('请选择要导出的分组', 'error');

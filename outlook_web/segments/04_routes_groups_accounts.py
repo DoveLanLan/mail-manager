@@ -38,9 +38,7 @@ def login():
             if verify_password(password, stored_password):
                 # 登录成功，重置失败记录
                 reset_login_attempts(client_ip)
-                session['logged_in'] = True
-                session.permanent = True
-                session.modified = True  # 确保 Flask-Session 保存 session
+                establish_web_login_session()
                 return jsonify({'success': True, 'message': '登录成功'})
             else:
                 # 登录失败，记录失败次数
@@ -59,7 +57,7 @@ def login():
 @app.route('/logout')
 def logout():
     """退出登录"""
-    session.pop('logged_in', None)
+    clear_web_login_session()
     return redirect(url_for('login'))
 
 
@@ -115,6 +113,7 @@ def api_extension_login():
     extension_login_tokens[token] = {
         'expires_at': time.time() + EXTENSION_LOGIN_TOKEN_TTL_SECONDS,
         'next': next_path,
+        'login_session_version': get_login_session_version(),
     }
 
     return jsonify({
@@ -133,9 +132,11 @@ def extension_login(token):
     if not payload:
         return redirect(url_for('login'))
 
-    session['logged_in'] = True
-    session.permanent = True
-    session.modified = True
+    token_version = str(payload.get('login_session_version') or DEFAULT_LOGIN_SESSION_VERSION)
+    if token_version != get_login_session_version():
+        return redirect(url_for('login'))
+
+    establish_web_login_session()
     return redirect(normalize_extension_next_path(request.args.get('next') or payload.get('next') or '/'))
 
 
@@ -155,34 +156,47 @@ def favicon():
 @app.route('/assets/index.css')
 def bundled_index_css():
     """返回合并后的首页样式，避免代理层拦截 CSS @import 子请求。"""
-    css_root = Path(app.static_folder) / 'css' / 'index'
-    css_parts = (
-        '01-base.css',
-        '02-navbar.css',
-        '03-layout.css',
-        '04-account-panel.css',
-        '05-email-content.css',
-        '06-modals-toast.css',
-        '07-meta.css',
-        '08-responsive.css',
-    )
+    static_root = Path(app.static_folder)
 
     combined_css = '\n\n'.join(
-        (css_root / filename).read_text(encoding='utf-8')
-        for filename in css_parts
+        (static_root / filename).read_text(encoding='utf-8')
+        for filename in INDEX_CSS_FILES
     )
-    return Response(combined_css, mimetype='text/css')
+    response = Response(combined_css, mimetype='text/css')
+    response.headers['ETag'] = f'"index-{compute_static_assets_hash(INDEX_CSS_FILES)}"'
+    if request.args.get('v'):
+        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    else:
+        response.headers['Cache-Control'] = 'no-cache, max-age=0'
+    return response
+
+
+@app.route('/assets/active-skin.css')
+def active_skin_css():
+    """返回当前启用皮肤的 CSS；失败时回退为空 classic 覆盖。"""
+    css_text, asset_hash = get_active_skin_css()
+    response = Response(css_text, mimetype='text/css')
+    response.headers['Cache-Control'] = 'public, max-age=300'
+    response.headers['ETag'] = f'"skin-{asset_hash}"'
+    return response
 
 
 @app.route('/')
 @login_required
 def index():
     """主页"""
-    return render_template(
+    response = make_response(render_template(
         'index.html',
         app_version=APP_VERSION,
         changelog_url=CHANGELOG_URL,
-    )
+        frontend_asset_hash=get_frontend_asset_hash(),
+        skin_asset_hash=get_active_skin_asset_hash(),
+    ))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    response.vary.add('Cookie')
+    return response
 
 
 @app.route('/api/version-status', methods=['GET'])
@@ -223,17 +237,17 @@ def get_csrf_token():
 def api_get_groups():
     """获取所有分组"""
     groups = load_groups()
-    movable_position = 1
     # 添加每个分组的邮箱数量
     for group in groups:
         if group['name'] == '临时邮箱':
             # 临时邮箱分组从 temp_emails 表获取数量
             group['account_count'] = get_temp_email_count()
+            group['descendant_account_count'] = group['account_count']
             group['sort_position'] = None
         else:
             group['account_count'] = get_group_account_count(group['id'])
-            group['sort_position'] = movable_position
-            movable_position += 1
+            group['descendant_account_count'] = get_group_account_count(group['id'], recursive=True)
+            group['sort_position'] = get_group_sort_position(group['id'])
     return jsonify({'success': True, 'groups': groups})
 
 
@@ -245,6 +259,7 @@ def api_get_group(group_id):
     if not group:
         return jsonify({'success': False, 'error': '分组不存在'})
     group['account_count'] = get_group_account_count(group_id)
+    group['descendant_account_count'] = get_group_account_count(group_id, recursive=True)
     group['sort_position'] = get_group_sort_position(group_id)
     return jsonify({'success': True, 'group': group})
 
@@ -261,16 +276,22 @@ def api_add_group():
     fallback_proxy_url_1 = data.get('fallback_proxy_url_1', '').strip()
     fallback_proxy_url_2 = data.get('fallback_proxy_url_2', '').strip()
     sort_position_raw = data.get('sort_position')
+    parent_id_raw = data.get('parent_id')
 
     if not name:
         return jsonify({'success': False, 'error': '分组名称不能为空'})
 
     try:
         sort_position = int(sort_position_raw) if sort_position_raw not in (None, '') else None
+        parent_id = normalize_group_parent_id(parent_id_raw)
     except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': '排序位置无效'})
+        return jsonify({'success': False, 'error': '分组参数无效'})
 
-    group_id = add_group(name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, sort_position)
+    valid_parent, parent_error, _ = validate_group_parent_for_create(parent_id)
+    if not valid_parent:
+        return jsonify({'success': False, 'error': parent_error})
+
+    group_id = add_group(name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, sort_position, parent_id)
     if group_id:
         return jsonify({'success': True, 'message': '分组创建成功', 'group_id': group_id})
     else:
@@ -289,16 +310,31 @@ def api_update_group(group_id):
     fallback_proxy_url_1 = data.get('fallback_proxy_url_1', '').strip()
     fallback_proxy_url_2 = data.get('fallback_proxy_url_2', '').strip()
     sort_position_raw = data.get('sort_position')
+    parent_id_provided = 'parent_id' in data
+    parent_id_raw = data.get('parent_id') if parent_id_provided else None
 
     if not name:
         return jsonify({'success': False, 'error': '分组名称不能为空'})
 
     try:
         sort_position = int(sort_position_raw) if sort_position_raw not in (None, '') else None
+        parent_id = normalize_group_parent_id(parent_id_raw) if parent_id_provided else None
     except (TypeError, ValueError):
-        return jsonify({'success': False, 'error': '排序位置无效'})
+        return jsonify({'success': False, 'error': '分组参数无效'})
 
-    if update_group(group_id, name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, sort_position):
+    if parent_id_provided:
+        valid_move, move_error = validate_group_move(group_id, parent_id)
+        if not valid_move:
+            return jsonify({'success': False, 'error': move_error})
+        update_success = update_group(
+            group_id, name, description, color, proxy_url,
+            fallback_proxy_url_1, fallback_proxy_url_2, sort_position,
+            parent_id=parent_id
+        )
+    else:
+        update_success = update_group(group_id, name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, sort_position)
+
+    if update_success:
         return jsonify({'success': True, 'message': '分组更新成功'})
     else:
         return jsonify({'success': False, 'error': '更新失败'})
@@ -310,11 +346,17 @@ def api_delete_group(group_id):
     """删除分组"""
     if group_id == 1:
         return jsonify({'success': False, 'error': '默认分组不能删除'})
-    
-    if delete_group(group_id):
-        return jsonify({'success': True, 'message': '分组已删除，邮箱已移至默认分组'})
+
+    result = delete_group_tree(group_id)
+    if result.get('success'):
+        child_count = int(result.get('deleted_child_count') or 0)
+        return jsonify({
+            'success': True,
+            'message': '分组已删除，邮箱已移至默认分组',
+            'deleted_child_count': child_count,
+        })
     else:
-        return jsonify({'success': False, 'error': '删除失败'})
+        return jsonify({'success': False, 'error': result.get('error') or '删除失败'})
 
 
 @app.route('/api/groups/reorder', methods=['PUT'])
@@ -323,14 +365,53 @@ def api_reorder_groups():
     """重新排序分组"""
     data = request.json or {}
     group_ids = data.get('group_ids', [])
+    parent_id_raw = data.get('parent_id')
 
     if not isinstance(group_ids, list) or not all(isinstance(group_id, int) for group_id in group_ids):
         return jsonify({'success': False, 'error': '分组排序参数无效'})
 
-    if reorder_groups(group_ids):
+    try:
+        parent_id = normalize_group_parent_id(parent_id_raw)
+    except ValueError:
+        return jsonify({'success': False, 'error': '父分组无效'})
+
+    if reorder_groups(group_ids, parent_id):
         return jsonify({'success': True, 'message': '分组排序已更新'})
     else:
         return jsonify({'success': False, 'error': '分组排序失败'})
+
+
+def append_temp_email_export_sections(lines: List[str], temp_emails: List[Dict[str, Any]]) -> int:
+    exported_count = 0
+    gptmail_list = [te for te in temp_emails if te.get('provider', 'gptmail') == 'gptmail']
+    duckmail_list = [te for te in temp_emails if te.get('provider') == 'duckmail']
+    cloudflare_list = [te for te in temp_emails if te.get('provider') == 'cloudflare']
+
+    if gptmail_list:
+        lines.append('[gptmail]')
+        for te in gptmail_list:
+            lines.append(te['email'])
+            exported_count += 1
+
+    if duckmail_list:
+        lines.append('[duckmail]')
+        for te in duckmail_list:
+            duckmail_password = decrypt_data(te.get('duckmail_password', '')) if te.get('duckmail_password') else ''
+            lines.append(f"{te['email']}----{duckmail_password}")
+            exported_count += 1
+
+    if cloudflare_list:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for te in cloudflare_list:
+            channel_name = str(te.get('cloudflare_channel_name') or 'default').strip() or 'default'
+            grouped.setdefault(channel_name, []).append(te)
+        for channel_name in sorted(grouped.keys(), key=str.lower):
+            lines.append(f'[cloudflare:{channel_name}]')
+            for te in grouped[channel_name]:
+                lines.append(te['email'])
+                exported_count += 1
+
+    return exported_count
 
 
 @app.route('/api/groups/<int:group_id>/export')
@@ -365,28 +446,7 @@ def api_export_group(group_id):
             return jsonify({'success': False, 'error': '该分组下没有临时邮箱'})
 
         lines.append(group['name'])
-
-        # 按渠道分组
-        gptmail_list = [te for te in temp_emails if te.get('provider', 'gptmail') == 'gptmail']
-        duckmail_list = [te for te in temp_emails if te.get('provider') == 'duckmail']
-        cloudflare_list = [te for te in temp_emails if te.get('provider') == 'cloudflare']
-
-        if gptmail_list:
-            lines.append('[gptmail]')
-            for te in gptmail_list:
-                lines.append(te['email'])
-
-        if duckmail_list:
-            lines.append('[duckmail]')
-            for te in duckmail_list:
-                duckmail_password = decrypt_data(te.get('duckmail_password', '')) if te.get('duckmail_password') else ''
-                lines.append(f"{te['email']}----{duckmail_password}")
-
-        if cloudflare_list:
-            lines.append('[cloudflare]')
-            for te in cloudflare_list:
-                cloudflare_jwt = decrypt_data(te.get('cloudflare_jwt', '')) if te.get('cloudflare_jwt') else ''
-                lines.append(f"{te['email']}----{cloudflare_jwt}")
+        append_temp_email_export_sections(lines, temp_emails)
 
         log_audit('export', 'group', str(group_id), f"导出临时邮箱分组的 {len(temp_emails)} 个临时邮箱")
     else:
@@ -431,6 +491,7 @@ def build_group_export_content(group_ids: List[int]) -> Dict[str, Any]:
     """生成与“导出选中分组”一致的导出内容。"""
     all_lines = []
     exported_group_ids = []
+    exported_account_ids = set()
     total_count = 0
 
     for group_id in group_ids:
@@ -445,44 +506,26 @@ def build_group_export_content(group_ids: List[int]) -> Dict[str, Any]:
 
             exported_group_ids.append(group_id)
             all_lines.append(group['name'])
-
-            gptmail_list = [te for te in temp_emails if te.get('provider', 'gptmail') == 'gptmail']
-            duckmail_list = [te for te in temp_emails if te.get('provider') == 'duckmail']
-            cloudflare_list = [te for te in temp_emails if te.get('provider') == 'cloudflare']
-
-            if gptmail_list:
-                all_lines.append('[gptmail]')
-                for te in gptmail_list:
-                    all_lines.append(te['email'])
-                    total_count += 1
-
-            if duckmail_list:
-                all_lines.append('[duckmail]')
-                for te in duckmail_list:
-                    duckmail_password = decrypt_data(te.get('duckmail_password', '')) if te.get('duckmail_password') else ''
-                    all_lines.append(f"{te['email']}----{duckmail_password}")
-                    total_count += 1
-
-            if cloudflare_list:
-                all_lines.append('[cloudflare]')
-                for te in cloudflare_list:
-                    cloudflare_jwt = decrypt_data(te.get('cloudflare_jwt', '')) if te.get('cloudflare_jwt') else ''
-                    all_lines.append(f"{te['email']}----{cloudflare_jwt}")
-                    total_count += 1
+            total_count += append_temp_email_export_sections(all_lines, temp_emails)
             continue
 
-        accounts = load_accounts(group_id)
+        accounts = [
+            account for account in load_accounts(group_id)
+            if int(account.get('id') or 0) not in exported_account_ids
+        ]
         if not accounts:
             continue
 
         exported_group_ids.append(group_id)
         all_lines.append(group['name'])
         for acc in accounts:
+            exported_account_ids.add(int(acc.get('id') or 0))
             all_lines.append(format_account_export_line(acc))
             total_count += 1
 
     return {
         'content': '\n'.join(all_lines),
+        'lines': all_lines,
         'total_count': total_count,
         'group_ids': exported_group_ids,
     }
@@ -774,7 +817,7 @@ def api_get_accounts():
 def api_external_get_accounts():
     """对外 API：通过 API Key 获取邮箱账号列表"""
     group_id = request.args.get('group_id', type=int)
-    accounts = load_accounts(group_id)
+    accounts = load_accounts(group_id, include_descendants=False)
 
     safe_accounts = []
     for acc in accounts:
@@ -1215,20 +1258,28 @@ def api_get_account(account_id):
     account = get_account_by_id(account_id)
     if not account:
         return jsonify({'success': False, 'error': '账号不存在'})
-    
+
+    log_audit(
+        'view_account_detail',
+        'account',
+        str(account_id),
+        f"查看账号 '{account.get('email', '')}' 详情（含密码字段）"
+    )
     return jsonify({
         'success': True,
         'account': {
             'id': account['id'],
             'email': account['email'],
-            'password': account['password'],
+            'has_password': bool(account.get('password')),
+            'password': account.get('password', '') or '',
             'client_id': account['client_id'],
             'refresh_token': account['refresh_token'],
             'account_type': account.get('account_type', 'outlook'),
             'provider': account.get('provider', 'outlook'),
             'imap_host': account.get('imap_host', ''),
             'imap_port': account.get('imap_port', 993),
-            'imap_password': account.get('imap_password', ''),
+            'has_imap_password': bool(account.get('imap_password')),
+            'imap_password': account.get('imap_password', '') or '',
             'aliases': account.get('aliases', []),
             'alias_count': account.get('alias_count', 0),
             'matched_alias': account.get('matched_alias', ''),
@@ -1244,7 +1295,8 @@ def api_get_account(account_id):
             'remark': account.get('remark', ''),
             'status': account.get('status', 'active'),
             'created_at': account.get('created_at', ''),
-            'updated_at': account.get('updated_at', '')
+            'updated_at': account.get('updated_at', ''),
+            'tags': get_account_tags(account['id'])
         }
     })
 
@@ -1391,21 +1443,21 @@ def api_update_account(account_id):
         # 只更新状态
         return api_update_account_status(account_id, data['status'])
 
+    current_account = get_account_by_id(account_id) or {}
     email_addr = data.get('email', '')
-    password = data.get('password', '')
+    password = data['password'] if 'password' in data else current_account.get('password', '')
     client_id = data.get('client_id', '')
     refresh_token = data.get('refresh_token', '')
     account_type = data.get('account_type', 'outlook')
     provider = data.get('provider', 'outlook')
     imap_host = (data.get('imap_host', '') or '').strip()
     imap_port = data.get('imap_port', 993)
-    imap_password = data.get('imap_password', '')
+    imap_password = data['imap_password'] if 'imap_password' in data else current_account.get('imap_password', '')
     group_id = data.get('group_id', 1)
     sort_order = parse_account_sort_order_input(data.get('sort_order')) if 'sort_order' in data else None
     remark = sanitize_input(data.get('remark', ''), max_length=200)
     status = data.get('status', 'active')
     forward_enabled = bool(data.get('forward_enabled', False))
-    current_account = get_account_by_id(account_id) or {}
     proxy_url = str(data.get('proxy_url', current_account.get('proxy_url', '')) or '').strip()
     fallback_proxy_url_1 = str(
         data.get('fallback_proxy_url_1', current_account.get('fallback_proxy_url_1', '')) or ''
@@ -1415,6 +1467,8 @@ def api_update_account(account_id):
     ).strip()
     aliases_provided = 'aliases' in data
     aliases = parse_alias_payload(data.get('aliases', [])) if aliases_provided else []
+    tag_ids_provided = 'tag_ids' in data
+    normalized_tag_ids = normalize_tag_ids_input(data.get('tag_ids', [])) if tag_ids_provided else []
 
     provider_meta = get_provider_meta(provider, email_addr)
     is_outlook = (account_type == 'outlook') or provider_meta['key'] == 'outlook'
@@ -1453,13 +1507,20 @@ def api_update_account(account_id):
         proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
     ):
         cleaned_aliases = get_account_aliases(account_id)
+        db = get_db()
         if aliases_provided:
-            db = get_db()
             alias_success, cleaned_aliases, alias_errors = replace_account_aliases(account_id, email_addr, aliases, db)
             if not alias_success:
                 db.rollback()
                 return jsonify({'success': False, 'error': '；'.join(alias_errors), 'errors': alias_errors})
-            db.commit()
+        if tag_ids_provided:
+            db.execute('DELETE FROM account_tags WHERE account_id = ?', (account_id,))
+            for tid in normalized_tag_ids:
+                db.execute(
+                    'INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)',
+                    (account_id, tid)
+                )
+        db.commit()
         return jsonify({'success': True, 'message': '账号更新成功', 'aliases': cleaned_aliases})
     else:
         return jsonify({'success': False, 'error': '更新失败'})

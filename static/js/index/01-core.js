@@ -1,4 +1,4 @@
-        /* global applyPendingNewMailSync, closeAllModals, debounce, ensureForwardingSettingsUI, handleGlobalGroupPointerMove, handleGlobalGroupPointerUp, hasPendingNewMailSync, initAccountListScroll, initAccountPageSizeSelect, initAccountSearchScopeSelect, initAccountSelectionGestures, initColorPicker, initEmailListScroll, loadGroups, loadMoreCloudflareGlobalMessages, loadTags, renderEmailList, scheduleEmailListLoadCheck, searchAccounts */
+        /* global applyPendingNewMailSync, closeAllModals, debounce, ensureForwardingSettingsUI, handleGlobalGroupPointerMove, handleGlobalGroupPointerUp, hasPendingNewMailSync, initAccountListScroll, initAccountPageSizeSelect, initAccountSearchInput, initAccountSearchScopeSelect, initAccountSelectionGestures, initColorPicker, initEmailListScroll, loadGroups, loadMoreCloudflareGlobalMessages, loadTags, renderEmailList, saveAccountSearchQueryPreference, scheduleEmailListLoadCheck, searchAccounts */
 
         // 全局状态
         let csrfToken = null;
@@ -53,7 +53,7 @@
         const REFRESH_STREAM_STALL_TIMEOUT_MS = 70000;
         const VERSION_STATUS_REQUEST_TIMEOUT_MS = 12000;
         const DOCKER_UPDATE_REQUEST_TIMEOUT_MS = 20000;
-        const RELEASE_NOTICE_SEEN_VERSION_KEY = 'outlook_release_notice_seen_version';
+        const UPDATE_NOTICE_SEEN_VERSION_KEY = 'outlook_update_notice_seen_latest_version';
         const DEFAULT_APP_TIME_ZONE = 'Asia/Shanghai';
         const FALLBACK_APP_TIME_ZONES = [
             'Asia/Shanghai',
@@ -732,22 +732,33 @@
         }
 
         function refreshDockerUpdateButton() {
-            const updateButton = document.getElementById('appVersionDockerUpdateBtn');
-            if (!updateButton) return;
+            const updateButtons = [
+                document.getElementById('appVersionDockerUpdateBtn'),
+                document.getElementById('releaseNoticeDockerUpdateBtn'),
+            ].filter(Boolean);
+            if (!updateButtons.length) return;
 
             const enabled = dockerUpdateStatus?.enabled === true;
             const available = dockerUpdateStatus?.available === true;
             const running = dockerUpdateStatus?.state?.running === true;
             const updateAvailable = currentVersionStatusState === 'update_available';
-            const defaultLabel = updateButton.dataset.defaultLabel || 'Docker 更新';
-            const unavailableLabel = updateButton.dataset.unavailableLabel || '不可在线更新';
 
-            updateButton.hidden = !(enabled && updateAvailable);
-            updateButton.disabled = !available || running;
-            updateButton.textContent = running ? '更新中...' : (available ? defaultLabel : unavailableLabel);
-            updateButton.title = available
-                ? '启动 Docker 在线更新'
-                : (dockerUpdateStatus?.reason || 'Docker 更新不可用');
+            updateButtons.forEach(updateButton => {
+                const defaultLabel = updateButton.dataset.defaultLabel || 'Docker 更新';
+                const unavailableLabel = updateButton.dataset.unavailableLabel || '不可在线更新';
+
+                updateButton.hidden = !(enabled && updateAvailable);
+                updateButton.disabled = !available || running;
+                updateButton.textContent = running ? '更新中...' : (available ? defaultLabel : unavailableLabel);
+                updateButton.title = available
+                    ? '启动 Docker 在线更新'
+                    : (dockerUpdateStatus?.reason || 'Docker 更新不可用');
+            });
+
+            const dockerHint = document.getElementById('releaseNoticeDockerHint');
+            if (dockerHint) {
+                dockerHint.hidden = !updateAvailable || available;
+            }
         }
 
         async function loadDockerUpdateStatus(forceRefresh = false) {
@@ -818,8 +829,10 @@
             const confirmed = window.confirm('将启动 Docker 在线更新，容器可能会自动重启。确认继续？');
             if (!confirmed) return;
 
-            updateButton.disabled = true;
-            updateButton.textContent = '更新中...';
+            document.querySelectorAll('#appVersionDockerUpdateBtn, #releaseNoticeDockerUpdateBtn').forEach(button => {
+                button.disabled = true;
+                button.textContent = '更新中...';
+            });
 
             try {
                 const response = await fetchWithTimeout('/api/docker-update', {
@@ -900,6 +913,7 @@
                         throw new Error(payload.error || '版本状态获取失败');
                     }
                     applyVersionStatus(payload.version_status);
+                    showUpdateNoticeIfNeeded(payload.version_status);
                     return payload.version_status;
                 })
                 .catch(() => {
@@ -1121,6 +1135,8 @@
 
         // 初始化
         document.addEventListener('DOMContentLoaded', async function () {
+            // 初始化主题
+            initTheme();
             // 初始化 CSRF Token
             await initCSRFToken();
             await loadAppTimeZoneFromSettings();
@@ -1130,6 +1146,41 @@
             document.addEventListener('click', handleGlobalChromeClick);
             document.addEventListener('click', handleGlobalTagFilterClick);
             document.addEventListener('click', handleGlobalImportTagClick);
+            document.addEventListener('click', handleGlobalEditTagClick);
+            
+            // Dropdown menu click handling (for batch actions and navbar settings)
+            document.addEventListener('click', function(e) {
+                // Batch action dropdowns
+                const activeBatchDropdown = e.target.closest('.batch-dropdown');
+                const batchToggle = e.target.closest('.batch-dropdown .dropdown-toggle');
+                
+                document.querySelectorAll('.batch-dropdown').forEach(dropdown => {
+                    if (dropdown !== activeBatchDropdown) {
+                        dropdown.classList.remove('is-open');
+                    }
+                });
+                
+                if (batchToggle && activeBatchDropdown) {
+                    activeBatchDropdown.classList.toggle('is-open');
+                    e.stopPropagation();
+                }
+
+                // Navbar dropdowns
+                const activeNavDropdown = e.target.closest('.navbar-dropdown');
+                const navToggle = e.target.closest('.navbar-dropdown .dropdown-toggle');
+                
+                document.querySelectorAll('.navbar-dropdown').forEach(dropdown => {
+                    if (dropdown !== activeNavDropdown) {
+                        dropdown.classList.remove('is-open');
+                    }
+                });
+                
+                if (navToggle && activeNavDropdown) {
+                    activeNavDropdown.classList.toggle('is-open');
+                    e.stopPropagation();
+                }
+            });
+
             document.getElementById('importImapHost')?.addEventListener('input', updateImportHint);
             document.getElementById('importImapPort')?.addEventListener('input', updateImportHint);
             document.getElementById('oauthEmailInput')?.addEventListener('input', invalidateRefreshTokenPreview);
@@ -1177,6 +1228,7 @@
             initAccountListScroll();
             initAccountPageSizeSelect();
             initAccountSearchScopeSelect();
+            initAccountSearchInput();
             if (typeof initAccountSelectionGestures === 'function') {
                 initAccountSelectionGestures();
             }
@@ -1187,15 +1239,21 @@
             // 绑定搜索框事件
             const searchInput = document.getElementById('globalSearch');
             if (searchInput) {
-                const debouncedSearch = debounce((e) => {
-                    searchAccounts(e.target.value);
+                const debouncedSearch = debounce((value) => {
+                    searchAccounts(value);
                 }, 300);
-                searchInput.addEventListener('input', debouncedSearch);
+                searchInput.addEventListener('input', function (event) {
+                    saveAccountSearchQueryPreference(event.target.value);
+                    debouncedSearch(event.target.value);
+                });
             }
+
+            // 初始化折叠状态和极简模式状态
+            initGroupPanelCollapseState();
+            initAccountMinimalModeState();
 
             syncResponsiveUI();
             handleExtensionLaunchHash();
-            window.setTimeout(showReleaseNoticeIfNeeded, 900);
         });
 
         function handleExtensionLaunchHash() {
@@ -1222,17 +1280,13 @@
         }
 
         function getCurrentReleaseNoticeVersion() {
-            const modalVersion = document.getElementById('releaseNoticeModal')?.dataset?.releaseVersion;
-            if (modalVersion) {
-                return String(modalVersion).trim();
-            }
-            const versionText = document.getElementById('appVersionValue')?.textContent || '';
-            return String(versionText).replace(/^v/i, '').trim();
+            const modalVersion = document.getElementById('releaseNoticeModal')?.dataset?.latestVersion;
+            return String(modalVersion || '').trim();
         }
 
         function getSeenReleaseNoticeVersion() {
             try {
-                return localStorage.getItem(RELEASE_NOTICE_SEEN_VERSION_KEY) || '';
+                return localStorage.getItem(UPDATE_NOTICE_SEEN_VERSION_KEY) || '';
             } catch (error) {
                 return '';
             }
@@ -1240,23 +1294,101 @@
 
         function markReleaseNoticeSeen(version) {
             try {
-                localStorage.setItem(RELEASE_NOTICE_SEEN_VERSION_KEY, String(version || ''));
+                localStorage.setItem(UPDATE_NOTICE_SEEN_VERSION_KEY, String(version || ''));
             } catch (error) {
                 // localStorage 不可用时不阻断主界面。
             }
         }
 
-        function showReleaseNoticeIfNeeded() {
+        function renderReleaseNotice(versionStatus = {}) {
             const modal = document.getElementById('releaseNoticeModal');
             if (!modal) {
+                return false;
+            }
+
+            const currentVersion = String(versionStatus.current_version || '').trim();
+            const latestVersion = String(versionStatus.latest_version || '').trim();
+            const updateUrl = String(versionStatus.update_url || versionStatus.changelog_url || '').trim();
+            const changelogUrl = String(versionStatus.changelog_url || updateUrl || '').trim();
+            const releaseNotes = versionStatus.release_notes || {};
+            const noteEntries = Array.isArray(releaseNotes.entries) && releaseNotes.entries.length > 0
+                ? releaseNotes.entries.slice(0, 3)
+                : [{
+                    title: releaseNotes.title || latestVersion || '更新内容',
+                    items: Array.isArray(releaseNotes.items) ? releaseNotes.items : [],
+                }];
+            const hint = String(versionStatus.hint || '发现新版本').trim();
+
+            modal.dataset.latestVersion = latestVersion;
+
+            const summaryEl = document.getElementById('releaseNoticeVersionSummary');
+            if (summaryEl) {
+                summaryEl.textContent = `当前版本：${currentVersion || '-'} / 最新版本：${latestVersion || '-'}`;
+            }
+
+            const listEl = document.getElementById('releaseNoticeNotesList');
+            if (listEl) {
+                const cards = noteEntries
+                    .map((entry, index) => {
+                        const entryTitle = String(entry?.title || (index === 0 ? latestVersion : '更新内容')).trim();
+                        const entryItems = Array.isArray(entry?.items) ? entry.items : [];
+                        const itemsMarkup = entryItems.length > 0
+                            ? entryItems.map(item => `<li>${escapeHtml(String(item || ''))}</li>`).join('')
+                            : '<li>暂时无法获取更新内容，可查看完整更新日志。</li>';
+                        const badgeMarkup = index === 0 ? '<span class="release-notice-badge">最新</span>' : '';
+                        return `
+                            <div class="release-notice-card release-notice-entry">
+                                <div class="release-notice-entry-header">
+                                    <div class="release-notice-card-title">${escapeHtml(entryTitle)}</div>
+                                    ${badgeMarkup}
+                                </div>
+                                <ul>${itemsMarkup}</ul>
+                            </div>
+                        `;
+                    })
+                    .join('');
+                listEl.innerHTML = cards || `
+                    <div class="release-notice-card release-notice-entry">
+                        <div class="release-notice-entry-header">
+                            <div class="release-notice-card-title">更新内容</div>
+                            <span class="release-notice-badge">最新</span>
+                        </div>
+                        <ul><li>暂时无法获取更新内容，可查看完整更新日志。</li></ul>
+                    </div>
+                `;
+            }
+
+            const hintEl = document.getElementById('releaseNoticeHint');
+            if (hintEl) {
+                hintEl.textContent = `${hint}。此提示每个新版本只会显示一次。`;
+            }
+
+            const changelogLink = document.getElementById('releaseNoticeChangelogLink');
+            if (changelogLink && changelogUrl) {
+                changelogLink.href = changelogUrl;
+            }
+
+            const updateLink = document.getElementById('releaseNoticeUpdateLink');
+            if (updateLink && updateUrl) {
+                updateLink.href = updateUrl;
+            }
+
+            return true;
+        }
+
+        function showUpdateNoticeIfNeeded(versionStatus = {}) {
+            const latestVersion = String(versionStatus.latest_version || '').trim();
+            if (String(versionStatus.status || '') !== 'update_available' || !latestVersion) {
                 return;
             }
 
-            const currentVersion = getCurrentReleaseNoticeVersion();
-            if (!currentVersion || getSeenReleaseNoticeVersion() === currentVersion) {
+            if (getSeenReleaseNoticeVersion() === latestVersion) {
                 return;
             }
 
+            if (!renderReleaseNotice(versionStatus)) {
+                return;
+            }
             showModal('releaseNoticeModal');
         }
 
@@ -1292,12 +1424,22 @@
         }
 
         function closeImportTagDropdown() {
-            document.getElementById('importTagDropdown')?.classList.remove('open');
+            document.getElementById('importTagFilterDropdown')?.classList.remove('open');
         }
 
         function handleGlobalImportTagClick(event) {
-            if (!event.target.closest('#importTagDropdown')) {
+            if (!event.target.closest('#importTagFilterDropdown')) {
                 closeImportTagDropdown();
+            }
+        }
+
+        function closeEditTagDropdown() {
+            document.getElementById('editTagFilterDropdown')?.classList.remove('open');
+        }
+
+        function handleGlobalEditTagClick(event) {
+            if (!event.target.closest('#editTagFilterDropdown')) {
+                closeEditTagDropdown();
             }
         }
 
@@ -1339,10 +1481,14 @@
 
                     if (action === 'copy') {
                         copyEmail(accountEmail);
+                    } else if (action === 'share') {
+                        showCreateEmailShareModal(accountId, accountEmail);
                     } else if (action === 'forwardingLogs') {
                         showAccountForwardingLogs(accountId, accountEmail);
                     } else if (action === 'toggleStatus') {
                         toggleAccountStatus(accountId, accountStatus);
+                    } else if (action === 'outlookAutoAuth') {
+                        queueAccountForOutlookAutoAuth(accountId, accountEmail);
                     } else if (action === 'edit') {
                         showEditAccountModal(accountId);
                     } else if (action === 'delete') {
@@ -1686,10 +1832,19 @@
         }
 
         // 显示刷新错误信息
-        function showRefreshError(accountId, errorMessage, accountEmail) {
+        function showRefreshError(accountId, errorMessage, accountEmail, accountType = 'outlook') {
             showModal('refreshErrorModal');
             document.getElementById('refreshErrorEmail').textContent = `账号：${accountEmail || '未知'}`;
             document.getElementById('refreshErrorMessage').textContent = errorMessage;
+            const reauthorizeBtn = document.getElementById('reauthorizeAccountFromErrorBtn');
+            const canReauthorize = !!accountId && String(accountType || 'outlook').toLowerCase() !== 'imap';
+            if (reauthorizeBtn) {
+                reauthorizeBtn.style.display = canReauthorize ? '' : 'none';
+                reauthorizeBtn.onclick = function () {
+                    hideRefreshErrorModal();
+                    showReauthorizeAccountModal({ id: accountId, email: accountEmail || '' });
+                };
+            }
             document.getElementById('editAccountFromErrorBtn').onclick = function () {
                 hideRefreshErrorModal();
                 showEditAccountModal(accountId);
@@ -1954,6 +2109,60 @@
             return err;
         }
 
+        function resolveFetchErrorMethodName(method, methodNames) {
+            if (methodNames[method]) return methodNames[method];
+            if (typeof method === 'string' && method.includes('.')) {
+                return method
+                    .split('.')
+                    .map((part) => methodNames[part] || part)
+                    .join(' / ');
+            }
+            return method;
+        }
+
+        function expandFolderProtocolFetchErrors(details) {
+            if (!details || typeof details !== 'object' || Array.isArray(details)) {
+                return details;
+            }
+            if (details.message && details.code) {
+                return details;
+            }
+
+            const protocolKeys = ['graph', 'imap_new', 'imap_old', 'imap_generic', 'browser'];
+            const hasTopLevelProtocol = protocolKeys.some((key) => details[key] !== undefined);
+            if (hasTopLevelProtocol) {
+                return details;
+            }
+
+            const expanded = {};
+            Object.keys(details).forEach((key) => {
+                const err = normalizeMethodError(details[key]);
+                const nested = err && typeof err === 'object'
+                    ? parseJsonLike(err.details)
+                    : null;
+                const nestedProtocols = (nested && typeof nested === 'object' && !Array.isArray(nested))
+                    ? protocolKeys.filter((protocolKey) => nested[protocolKey] !== undefined)
+                    : [];
+
+                if (nestedProtocols.length > 0) {
+                    nestedProtocols.forEach((protocolKey) => {
+                        expanded[`${key}.${protocolKey}`] = nested[protocolKey];
+                    });
+                    if (err && typeof err === 'object') {
+                        const summary = { ...err };
+                        delete summary.details;
+                        expanded[key] = summary;
+                    } else {
+                        expanded[key] = err;
+                    }
+                    return;
+                }
+
+                expanded[key] = details[key];
+            });
+            return expanded;
+        }
+
         // 显示统一错误详情模态框
         function showErrorDetailModal(error) {
             showModal('errorDetailModal');
@@ -1988,6 +2197,7 @@
                 'imap_new': 'IMAP（新服务器）',
                 'imap_old': 'IMAP（旧服务器）',
                 'imap_generic': '标准 IMAP',
+                'browser': '浏览器到服务端',
                 'inbox': '收件箱',
                 'junkemail': '垃圾邮件',
                 'deleteditems': '已删除邮件',
@@ -2000,10 +2210,23 @@
                 if (typeof err === 'string') return err;
 
                 const code = err.code || '';
+                const reasonCode = err.reason_code || code;
                 const details = formatFetchErrorDetails(err.details);
                 const msg = err.message || '';
 
                 // 翻译常见错误
+                if (reasonCode === 'MAIL_PROXY_FAILED') {
+                    return msg || '代理连接失败：请检查代理地址、端口、认证信息和回退代理设置';
+                }
+                if (reasonCode === 'MAIL_NETWORK_TIMEOUT' || code === 'EMAIL_FETCH_TIMEOUT') {
+                    return msg || '网络连接超时：请检查网络、代理和邮件服务地址';
+                }
+                if (reasonCode === 'MAIL_NETWORK_FAILED') {
+                    return msg || '网络连接失败：请检查 DNS、防火墙、代理和邮件服务地址';
+                }
+                if (reasonCode === 'MAIL_TLS_FAILED') {
+                    return msg || 'TLS/SSL 连接失败：请检查邮件服务地址、端口和系统证书';
+                }
                 if (code === 'GRAPH_TOKEN_EXCEPTION' && details.includes('ProxyError')) {
                     return '代理连接失败：无法连接到代理服务器，请检查代理地址是否正确以及代理是否在运行';
                 }
@@ -2037,13 +2260,16 @@
                 return msg || details || '未知错误';
             }
 
-            const detailEntries = (typeof details === 'object' && !Array.isArray(details) && !(details.message && details.code))
-                ? details
-                : { error: details };
-            const preferredOrder = ['graph', 'imap_new', 'imap_old', 'imap_generic', 'inbox', 'junkemail', 'deleteditems', 'all', 'error'];
+            const expandedDetails = expandFolderProtocolFetchErrors(details);
+            const detailEntries = (typeof expandedDetails === 'object' && !Array.isArray(expandedDetails) && !(expandedDetails.message && expandedDetails.code))
+                ? expandedDetails
+                : { error: expandedDetails };
+            const preferredOrder = ['browser', 'graph', 'imap_new', 'imap_old', 'imap_generic', 'inbox', 'junkemail', 'deleteditems', 'all', 'error'];
             const methods = [
                 ...preferredOrder.filter(method => detailEntries[method] !== undefined),
-                ...Object.keys(detailEntries).filter(method => !preferredOrder.includes(method))
+                ...Object.keys(detailEntries)
+                    .filter(method => !preferredOrder.includes(method))
+                    .sort((left, right) => String(left).localeCompare(String(right)))
             ];
 
             const summaryEl = document.getElementById('emailFetchErrorSummary');
@@ -2057,7 +2283,7 @@
             methods.forEach(method => {
                 const err = normalizeMethodError(detailEntries[method]);
                 if (err !== undefined) {
-                    const name = methodNames[method] || method;
+                    const name = resolveFetchErrorMethodName(method, methodNames);
                     const reason = translateError(err);
                     const codeText = (err && typeof err === 'object') ? (err.code || '-') : '-';
                     const typeText = (err && typeof err === 'object') ? (err.type || '-') : '-';
@@ -2068,13 +2294,13 @@
                         : formatFetchErrorDetails(detailEntries[method]);
                     html += `
                         <div style="background: #fff5f5; border: 1px solid #fde2e2; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px;">
-                            <div style="font-weight: 600; color: #dc3545; margin-bottom: 6px; font-size: 14px;">${name}</div>
-                            <div style="color: #333; font-size: 13px; line-height: 1.6;">${reason}</div>
+                            <div style="font-weight: 600; color: #dc3545; margin-bottom: 6px; font-size: 14px;">${escapeHtml(name)}</div>
+                            <div style="color: #333; font-size: 13px; line-height: 1.6;">${escapeHtml(reason)}</div>
                             <div style="color: #999; font-size: 12px; margin-top: 6px; line-height: 1.6;">
-                                错误代码: ${escapeHtml(codeText)}<br>
-                                类型: ${escapeHtml(typeText)}<br>
-                                状态码: ${escapeHtml(statusText)}<br>
-                                Trace ID: ${escapeHtml(traceIdText)}
+                                错误代码: ${escapeHtml(String(codeText))}<br>
+                                类型: ${escapeHtml(String(typeText))}<br>
+                                状态码: ${escapeHtml(String(statusText))}<br>
+                                Trace ID: ${escapeHtml(String(traceIdText))}
                             </div>
                             ${detailText ? `<pre style="margin-top:10px; padding:10px 12px; background:#fff; border:1px solid #f3caca; border-radius:6px; color:#444; font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-word; max-height:240px; overflow:auto;">${escapeHtml(detailText)}</pre>` : ''}
                         </div>
@@ -2174,8 +2400,13 @@ ${details}
         function updateCurrentGroupHeader(group = null, titleOverride = '') {
             const nameEl = document.getElementById('currentGroupName');
             const idBadgeEl = document.getElementById('currentGroupIdBadge');
+            const refreshBtn = document.getElementById('refreshAccountListBtn');
             if (!nameEl || !idBadgeEl) {
                 return;
+            }
+
+            if (refreshBtn) {
+                refreshBtn.style.display = (group || titleOverride) ? 'inline-flex' : 'none';
             }
 
             if (titleOverride) {
@@ -2192,8 +2423,120 @@ ${details}
                 return;
             }
 
-            const badgeText = formatGroupIdBadgeText(group.id);
-            nameEl.textContent = normalizeGroupName(group.name);
-            idBadgeEl.textContent = badgeText;
-            idBadgeEl.style.display = badgeText ? 'inline-flex' : 'none';
+            nameEl.textContent = '';
+            idBadgeEl.textContent = '';
+            idBadgeEl.style.display = 'none';
         }
+
+        // ------------------ 折叠分组栏 & 极简模式 ------------------
+        function initGroupPanelCollapseState() {
+            const isCollapsed = localStorage.getItem('outlook_group_panel_collapsed') === 'true';
+            document.body.classList.toggle('group-panel-collapsed', isCollapsed);
+
+            const collapseBtn = document.getElementById('collapseGroupPanelBtn');
+            const expandBtn = document.getElementById('expandGroupPanelBtn');
+            if (collapseBtn) collapseBtn.setAttribute('aria-expanded', !isCollapsed);
+            if (expandBtn) expandBtn.setAttribute('aria-expanded', isCollapsed);
+        }
+
+        function toggleGroupPanelCollapse() {
+            const isCollapsed = !document.body.classList.contains('group-panel-collapsed');
+            document.body.classList.toggle('group-panel-collapsed', isCollapsed);
+            localStorage.setItem('outlook_group_panel_collapsed', String(isCollapsed));
+
+            const collapseBtn = document.getElementById('collapseGroupPanelBtn');
+            const expandBtn = document.getElementById('expandGroupPanelBtn');
+            if (collapseBtn) collapseBtn.setAttribute('aria-expanded', !isCollapsed);
+            if (expandBtn) expandBtn.setAttribute('aria-expanded', isCollapsed);
+
+            if (typeof syncResponsiveUI === 'function') {
+                syncResponsiveUI();
+            }
+        }
+
+        function initAccountMinimalModeState() {
+            const isMinimal = localStorage.getItem('outlook_account_list_minimal') === 'true';
+            const panel = document.getElementById('accountPanel');
+            const btn = document.getElementById('accountMinimalBtn');
+            if (panel) {
+                panel.classList.toggle('minimal-mode', isMinimal);
+            }
+            if (btn) {
+                btn.classList.toggle('active', isMinimal);
+                btn.setAttribute('aria-pressed', isMinimal ? 'true' : 'false');
+                btn.title = isMinimal ? '切换详细展示' : '切换极简展示';
+            }
+        }
+
+        function toggleAccountMinimalMode() {
+            const panel = document.getElementById('accountPanel');
+            const btn = document.getElementById('accountMinimalBtn');
+            if (!panel) return;
+
+            const isMinimal = !panel.classList.contains('minimal-mode');
+            panel.classList.toggle('minimal-mode', isMinimal);
+            localStorage.setItem('outlook_account_list_minimal', String(isMinimal));
+
+            if (btn) {
+                btn.classList.toggle('active', isMinimal);
+                btn.setAttribute('aria-pressed', isMinimal ? 'true' : 'false');
+                btn.title = isMinimal ? '切换详细展示' : '切换极简展示';
+            }
+        }
+
+        // ==================== 主题与列表刷新相关 ====================
+        function initTheme() {
+            const savedTheme = localStorage.getItem('theme');
+            const currentTheme = savedTheme || 'light';
+            document.documentElement.setAttribute('data-theme', currentTheme);
+            updateThemeToggleIcons(currentTheme);
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            const newTheme = isDark ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+            updateThemeToggleIcons(newTheme);
+        }
+
+        function updateThemeToggleIcons(theme) {
+            const sunIcon = document.querySelector('#desktopThemeToggleBtn .sun-icon');
+            const moonIcon = document.querySelector('#desktopThemeToggleBtn .moon-icon');
+            if (sunIcon && moonIcon) {
+                if (theme === 'dark') {
+                    sunIcon.style.display = 'block';
+                    moonIcon.style.display = 'none';
+                } else {
+                    sunIcon.style.display = 'none';
+                    moonIcon.style.display = 'block';
+                }
+            }
+        }
+
+        async function refreshCurrentAccountList() {
+            const refreshBtn = document.getElementById('refreshAccountListBtn');
+            if (refreshBtn) {
+                refreshBtn.classList.add('spinning');
+                refreshBtn.disabled = true;
+            }
+            try {
+                if (typeof refreshVisibleAccountList === 'function') {
+                    await refreshVisibleAccountList(true);
+                } else if (isTempEmailGroup && typeof loadTempEmails === 'function') {
+                    await loadTempEmails(true);
+                } else if (currentGroupId && typeof loadAccountsByGroup === 'function') {
+                    await loadAccountsByGroup(currentGroupId, true);
+                }
+            } catch (e) {
+                console.error(e);
+            } finally {
+                if (refreshBtn) {
+                    refreshBtn.classList.remove('spinning');
+                    refreshBtn.disabled = false;
+                }
+            }
+        }
+
+        window.toggleTheme = toggleTheme;
+        window.refreshCurrentAccountList = refreshCurrentAccountList;

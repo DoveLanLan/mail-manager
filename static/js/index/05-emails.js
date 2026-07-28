@@ -1,4 +1,4 @@
-        /* global EMAIL_DETAIL_REQUEST_TIMEOUT_MS, EMAIL_LIST_REQUEST_TIMEOUT_MS, adjustIframeHeight, applyEmailListCache, closeMobilePanels, closeNavbarActionsMenu, copyCurrentEmail, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentMethod, currentSkip, emailListCache, escapeHtml, fetchWithTimeout, formatDate, getEmailListCacheEntry, getFolderDisplayName, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, invalidateEmailListCache, isNormalMailLocalRetentionEnabled, isTempEmailGroup, isTimeoutAbortError, loadCloudflareGlobalMessages, mergeFolderSummaries, normalizeFolderSummaries, renderCloudflareGlobalFilterBar, renderEmptyStateMarkup, scheduleEmailListLoadCheck, showMobileEmailDetail, showToast, updateMobileContext, updateModalBodyState */
+        /* global EMAIL_DETAIL_REQUEST_TIMEOUT_MS, EMAIL_LIST_REQUEST_TIMEOUT_MS, adjustIframeHeight, applyEmailListCache, closeMobilePanels, closeNavbarActionsMenu, copyCurrentEmail, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentMethod, currentSkip, emailListCache, escapeHtml, fetchWithTimeout, formatDate, getEmailListCacheEntry, getFolderDisplayName, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, invalidateEmailListCache, isNormalMailLocalRetentionEnabled, isTempEmailGroup, isTimeoutAbortError, loadCloudflareGlobalMessages, mergeFolderSummaries, normalizeFolderSummaries, renderCloudflareGlobalFilterBar, renderEmptyStateMarkup, scheduleEmailListLoadCheck, showEmailFetchErrorModal, showMobileEmailDetail, showToast, updateMobileContext, updateModalBodyState */
 
         // ==================== 邮件相关 ====================
 
@@ -8,6 +8,8 @@
 
         const backgroundMailboxSyncs = new Map();
         const pendingNewMailSyncs = new Map();
+        const BACKGROUND_MAIL_ERROR_MODAL_COOLDOWN_MS = 5 * 60 * 1000;
+        let lastBackgroundMailErrorModal = { key: '', shownAt: 0 };
         const normalDetailIframeResizeResources = { timers: [], observer: null };
         const fullscreenIframeResizeResources = { timers: [], observer: null };
         const NEW_EMAIL_HIGHLIGHT_CLEAR_DELAY_MS = 3500;
@@ -62,12 +64,10 @@
 
             if (refreshBtn) {
                 refreshBtn.disabled = isLoading && !isBackgroundSync;
-                refreshBtn.textContent = isLoading
-                    ? (isBackgroundSync ? '同步中...' : '获取中...')
+                refreshBtn.classList.toggle('spinning', isLoading);
+                refreshBtn.title = isLoading
+                    ? (isBackgroundSync ? '本地保留邮件已显示，正在后台同步远程邮件' : '正在获取邮件...')
                     : '获取邮件';
-                refreshBtn.title = isLoading && isBackgroundSync
-                    ? '本地保留邮件已显示，正在后台同步远程邮件'
-                    : '';
                 refreshBtn.toggleAttribute('aria-busy', isLoading);
             }
             folderTabs.forEach(tab => {
@@ -354,6 +354,46 @@
             }
         }
 
+        function buildBrowserMailFetchError(error) {
+            const isTimeout = isTimeoutAbortError(error);
+            const message = isTimeout
+                ? '网络连接超时：邮件服务未在规定时间内响应，请检查网络、代理和服务地址'
+                : '网络连接失败：浏览器无法连接邮件接口，请检查当前网络、代理和服务是否正常';
+            return {
+                code: isTimeout ? 'MAIL_NETWORK_TIMEOUT' : 'MAIL_NETWORK_FAILED',
+                message,
+                type: error?.name || 'NetworkError',
+                status: isTimeout ? 504 : 0,
+                category: 'network',
+                details: error?.message || String(error || ''),
+                trace_id: '-'
+            };
+        }
+
+        function getFetchErrorMessage(error) {
+            return buildBrowserMailFetchError(error).message;
+        }
+
+        function showBackgroundMailFetchErrorModal(context, details) {
+            const errorFingerprint = Object.entries(details || {}).map(([method, error]) => {
+                const value = error && typeof error === 'object'
+                    ? (error.reason_code || error.code || error.type || error.message || 'unknown')
+                    : String(error || 'unknown');
+                return `${method}:${value}`;
+            }).sort().join('|');
+            const key = `${context?.account || ''}_${context?.folder || ''}:${errorFingerprint}`;
+            const now = Date.now();
+            if (
+                key === lastBackgroundMailErrorModal.key
+                && now - lastBackgroundMailErrorModal.shownAt < BACKGROUND_MAIL_ERROR_MODAL_COOLDOWN_MS
+            ) {
+                return;
+            }
+
+            lastBackgroundMailErrorModal = { key, shownAt: now };
+            showEmailFetchErrorModal(details);
+        }
+
         async function fetchRemoteEmails(email, cacheKey, options = {}) {
             const requestFolder = options.folder || currentFolder;
             const requestMethod = options.method || getRemoteMailboxMethodFallback();
@@ -387,8 +427,12 @@
             if (options.preserveCurrentListOnError === true) {
                 window._lastFetchErrorDetails = fetchErrorDetails;
                 if (!options.context || isCurrentMailboxContext(options.context)) {
-                    setMailSyncStatus('后台同步失败，当前显示的是本地保留邮件');
-                    showToast('后台同步失败，已保留本地邮件列表', 'error');
+                    const errorMessage = data.error?.message
+                        || (typeof data.error === 'string' ? data.error : '')
+                        || '后台同步失败，已保留本地邮件列表';
+                    setMailSyncStatus(`后台同步失败：${errorMessage}`);
+                    showToast(errorMessage, 'error');
+                    showBackgroundMailFetchErrorModal(options.context, fetchErrorDetails);
                 }
                 return false;
             }
@@ -431,8 +475,11 @@
                 preserveCurrentListOnError: true
             }).catch(error => {
                 if (isCurrentMailboxContext(context)) {
-                    setMailSyncStatus('后台同步失败，当前显示的是本地保留邮件');
-                    showToast(isTimeoutAbortError(error) ? '后台同步超时' : '后台同步失败', 'error');
+                    const browserError = buildBrowserMailFetchError(error);
+                    const errorMessage = getFetchErrorMessage(error);
+                    setMailSyncStatus(`后台同步失败：${errorMessage}`);
+                    showToast(errorMessage, 'error');
+                    showBackgroundMailFetchErrorModal(context, { browser: browserError });
                 }
             }).finally(() => {
                 backgroundMailboxSyncs.delete(syncKey);
@@ -475,10 +522,10 @@
                 }
                 await fetchRemoteEmails(email, cacheKey);
             } catch (error) {
-                const errorMessage = isTimeoutAbortError(error)
-                    ? '获取邮件超时，请重试'
-                    : '网络错误，请重试';
+                const browserError = buildBrowserMailFetchError(error);
+                const errorMessage = getFetchErrorMessage(error);
                 setMailSyncStatus('');
+                showEmailFetchErrorModal({ browser: browserError });
                 container.innerHTML = renderEmptyStateMarkup('⚠️', errorMessage, {
                     onAction: 'refreshEmails()',
                     actionTitle: '刷新邮件列表'
@@ -658,10 +705,8 @@
             });
             if (isNormalMailboxListRequest() && isNormalMailLocalRetentionEnabled()) {
                 query.set('prefer_local', '1');
-                if (selectedEmail.id_mode) {
-                    query.set('id_mode', selectedEmail.id_mode);
-                }
             }
+            appendEmailIdModeParam(query, selectedEmail);
             return `/api/email/${encodeURIComponent(currentAccount)}/${encodeURIComponent(messageId)}?${query.toString()}`;
         }
 
@@ -1191,6 +1236,36 @@
             }
         }
 
+        function buildEmailDeleteItems(sourceItems) {
+            return (sourceItems || [])
+                .map(item => {
+                    if (!item) {
+                        return null;
+                    }
+                    if (typeof item !== 'object') {
+                        const messageId = String(item || '').trim();
+                        if (!messageId) {
+                            return null;
+                        }
+                        return {
+                            id: messageId,
+                            folder: currentFolder || 'inbox',
+                            id_mode: ''
+                        };
+                    }
+                    const messageId = String(item.id || item.message_id || '').trim();
+                    if (!messageId) {
+                        return null;
+                    }
+                    return {
+                        id: messageId,
+                        folder: String(item.folder || currentFolder || 'inbox'),
+                        id_mode: String(item.id_mode || item.idMode || '').trim()
+                    };
+                })
+                .filter(Boolean);
+        }
+
         async function confirmBatchDeleteEmails() {
             if (selectedEmailIds.size === 0) return;
 
@@ -1198,7 +1273,7 @@
                 return;
             }
 
-            await deleteEmails(Array.from(selectedEmailIds));
+            await deleteEmails(getSelectedEmailItems());
         }
 
         async function confirmDeleteCurrentEmail() {
@@ -1209,7 +1284,7 @@
                 return;
             }
 
-            await deleteEmails([currentEmailDetail.id]);
+            await deleteEmails([currentEmailDetail]);
         }
 
         function removeDeletedEmailsFromCachedLists(deletedIds, account = currentAccount) {
@@ -1231,7 +1306,12 @@
             });
         }
 
-        async function deleteEmails(ids) {
+        async function deleteEmails(sourceItems) {
+            const items = buildEmailDeleteItems(sourceItems);
+            if (!items.length) {
+                return;
+            }
+
             showToast('正在删除...', 'info');
 
             try {
@@ -1240,16 +1320,28 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         email: currentAccount,
-                        ids: ids
+                        method: getRemoteMailboxMethodFallback(),
+                        folder: currentFolder,
+                        items
                     })
                 });
 
                 const result = await response.json();
+                const deletedIdList = Array.isArray(result.deleted_ids) && result.deleted_ids.length
+                    ? result.deleted_ids
+                    : (Array.isArray(result.updated_ids) ? result.updated_ids : []);
+                const deletedIds = new Set(
+                    (deletedIdList.length ? deletedIdList : (result.success ? items.map(item => item.id) : []))
+                        .map(id => String(id))
+                );
 
-                if (result.success) {
-                    showToast(`成功删除 ${result.success_count} 封邮件`);
+                if (result.success || deletedIds.size > 0) {
+                    if (result.success && result.failed_count === 0) {
+                        showToast(`成功删除 ${result.success_count || deletedIds.size} 封邮件`);
+                    } else if (deletedIds.size > 0) {
+                        showToast(`已删除 ${deletedIds.size} 封，失败 ${result.failed_count || 0} 封`, 'warning');
+                    }
 
-                    const deletedIds = new Set(ids.map(id => String(id)));
                     currentEmails = currentEmails.filter(e => !deletedIds.has(String(e.id)));
                     removeDeletedEmailsFromCachedLists(deletedIds);
                     selectedEmailIds.clear();
@@ -1275,10 +1367,12 @@
                     // If errors
                     if (result.failed_count > 0) {
                         console.warn('Deletion errors:', result.errors);
-                        showToast(`部分删除失败 (${result.failed_count} 封)`, 'warning');
                     }
                 } else {
-                    showToast('删除失败: ' + (result.error || '未知错误'), 'error');
+                    const errorMessage = result.error && result.error.message
+                        ? result.error.message
+                        : (result.error || '未知错误');
+                    showToast('删除失败: ' + errorMessage, 'error');
                 }
             } catch (e) {
                 showToast('网络错误', 'error');
@@ -1342,15 +1436,31 @@
                     }
                 } else {
                     handleApiError(data, '加载邮件详情失败');
+                    const detailErrorMessage = data.error?.message
+                        || (typeof data.error === 'string' ? data.error : '')
+                        || '加载失败';
+                    const hasProtocolDetails = data.details
+                        && typeof data.details === 'object'
+                        && Object.keys(data.details).length > 0;
+                    if (hasProtocolDetails) {
+                        window._lastFetchErrorDetails = data.details;
+                    }
                     container.innerHTML = `
                         <div class="empty-state">
                             <div class="empty-state-icon">⚠️</div>
                             <div class="empty-state-text"></div>
+                            ${hasProtocolDetails ? '<div class="empty-state-actions" style="margin-top:12px;"><a href="javascript:void(0)" class="email-detail-error-link" style="color:#409eff;text-decoration:underline;">点击查看详情</a></div>' : ''}
                         </div>
                     `;
                     const errorText = container.querySelector('.empty-state-text');
                     if (errorText) {
-                        errorText.textContent = data.error && data.error.message ? data.error.message : '加载失败';
+                        errorText.textContent = detailErrorMessage;
+                    }
+                    const detailLink = container.querySelector('.email-detail-error-link');
+                    if (detailLink) {
+                        detailLink.addEventListener('click', () => {
+                            showEmailFetchErrorModal(window._lastFetchErrorDetails);
+                        });
                     }
                 }
             } catch (error) {

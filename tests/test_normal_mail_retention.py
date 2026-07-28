@@ -8,7 +8,6 @@ import sys
 import tempfile
 import unittest
 
-import pytest
 from unittest.mock import patch
 
 
@@ -184,20 +183,25 @@ class NormalMailRetentionTests(unittest.TestCase):
             fresh_db_path = os.path.join(temp_dir, 'fresh.db')
             with patch.object(web_outlook_app, 'DATABASE', fresh_db_path):
                 web_outlook_app.init_db()
-                with sqlite3.connect(fresh_db_path) as db:
+                db = sqlite3.connect(fresh_db_path)
+                try:
                     row = db.execute(
                         '''
                         SELECT value FROM settings
                         WHERE key = 'normal_mail_local_retention_enabled'
                         '''
                     ).fetchone()
+                finally:
+                    db.close()
 
                 response = self.client.get('/api/settings')
+                status_code = response.status_code
+                payload = response.get_json()
+                response.close()
 
         self.assertIsNotNone(row)
         self.assertEqual(row[0], 'false')
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
+        self.assertEqual(status_code, 200)
         self.assertTrue(payload['success'])
         self.assertEqual(
             payload['settings']['normal_mail_local_retention_enabled'],
@@ -685,14 +689,20 @@ class NormalMailRetentionTests(unittest.TestCase):
                 self.assertFalse(payload['success'])
                 self.assertEqual(payload['error'], '参数不完整')
 
-    def test_delete_emails_imap_uses_imap_oauth_token_and_remains_unsupported(self):
+    def test_delete_emails_imap_uses_imap_oauth_token_and_expunges(self):
         with patch.object(web_outlook_app, 'get_access_token_graph') as graph_token_mock, \
              patch.object(web_outlook_app, 'get_access_token_imap', return_value='imap-token') as imap_token_mock, \
-             patch.object(web_outlook_app.imaplib, 'IMAP4_SSL') as imap_mock:
+             patch.object(web_outlook_app.imaplib, 'IMAP4_SSL') as imap_mock, \
+             patch.object(web_outlook_app, 'resolve_imap_folder', return_value=('INBOX', {})) as resolve_folder_mock, \
+             patch.object(
+                 web_outlook_app,
+                 'store_imap_message_flags',
+                 return_value=(True, 'uid', [{'mode': 'uid', 'status': 'OK'}]),
+             ) as store_flags_mock:
             graph_token_mock.side_effect = AssertionError('Graph token helper should not be used for IMAP delete')
             connection = imap_mock.return_value
             connection.authenticate.return_value = ('OK', [b'Authenticated'])
-            connection.select.return_value = ('OK', [b'1'])
+            connection.expunge.return_value = ('OK', [None])
 
             result = web_outlook_app.delete_emails_imap(
                 'retained@example.com',
@@ -702,10 +712,12 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'imap.example.com',
                 'socks5://proxy.example:1080',
                 ['socks5://fallback.example:1080'],
+                items=[{'id': 'uid-1', 'folder': 'inbox', 'id_mode': 'uid'}],
             )
 
-        self.assertFalse(result['success'])
-        self.assertEqual(result['error'], 'IMAP 删除暂不支持 (ID 格式不兼容)')
+        self.assertTrue(result['success'])
+        self.assertEqual(result['success_count'], 1)
+        self.assertEqual(result['deleted_ids'], ['uid-1'])
         graph_token_mock.assert_not_called()
         imap_token_mock.assert_called_once_with(
             'client-id',
@@ -719,7 +731,61 @@ class NormalMailRetentionTests(unittest.TestCase):
             timeout=web_outlook_app.IMAP_TIMEOUT,
         )
         connection.authenticate.assert_called_once()
-        connection.select.assert_called_once_with('INBOX')
+        resolve_folder_mock.assert_called_once()
+        store_flags_mock.assert_called_once()
+        self.assertEqual(store_flags_mock.call_args.kwargs.get('flags'), r'(\Deleted)')
+        connection.expunge.assert_called_once_with()
+
+    def test_delete_emails_imap_account_uses_generic_imap_delete(self):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            db.commit()
+            added = web_outlook_app.add_account(
+                'imap-user@example.com',
+                'password',
+                '',
+                '',
+                group_id=1,
+                account_type='imap',
+                provider='custom',
+                imap_host='imap.example.com',
+                imap_port=993,
+                imap_password='imap-pass',
+            )
+            self.assertTrue(added)
+
+        remote_result = {
+            'success': True,
+            'success_count': 1,
+            'failed_count': 0,
+            'deleted_ids': ['uid-42'],
+            'updated_ids': ['uid-42'],
+            'errors': [],
+        }
+        with patch.object(web_outlook_app, 'delete_emails_graph') as graph_delete_mock, \
+             patch.object(
+                 web_outlook_app,
+                 'delete_emails_imap_generic_result',
+                 return_value=remote_result,
+             ) as generic_delete_mock:
+            graph_delete_mock.side_effect = AssertionError('Graph delete should not be used for IMAP accounts')
+            response = self.client.post(
+                '/api/emails/delete',
+                json={
+                    'email': 'imap-user@example.com',
+                    'method': 'imap',
+                    'folder': 'inbox',
+                    'items': [{'id': 'uid-42', 'folder': 'inbox', 'id_mode': 'uid'}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['deleted_ids'], ['uid-42'])
+        generic_delete_mock.assert_called_once()
+        graph_delete_mock.assert_not_called()
 
     def test_retained_action_row_counts_are_cumulative(self):
         with self.app.app_context():
@@ -1253,6 +1319,27 @@ class NormalMailRetentionTests(unittest.TestCase):
             db.commit()
         return attachments
 
+    def _seed_cached_detail_row_with_attachment_metadata(self, message_id, has_attachments, attachments):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                INSERT INTO retained_normal_mail_messages (
+                    account_id, folder, provider_message_id, id_mode,
+                    subject, sender, recipients, cc, received_at,
+                    has_attachments, body, body_type, attachments_json,
+                    body_cached, body_cached_at
+                )
+                VALUES (?, 'inbox', ?, 'graph',
+                        'Cached subject', 'cached-sender@example.com',
+                        'reader@example.com', 'copy@example.com',
+                        '2026-05-27T08:00:00Z', ?,
+                        '<p>Cached body</p>', 'html', ?, 1, CURRENT_TIMESTAMP)
+                ''',
+                (self.account['id'], message_id, 1 if has_attachments else 0, json.dumps(attachments))
+            )
+            db.commit()
+
     def _graph_detail_payload(self):
         return {
             'id': 'graph-detail-1',
@@ -1319,7 +1406,11 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'false',
             ))
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=graph_detail) as detail_mock, \
+        with patch.object(
+            web_outlook_app,
+            'get_email_detail_graph_result',
+            return_value={'success': True, 'detail': graph_detail},
+        ) as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=attachments) as attachments_mock:
             response = self.client.get(
                 '/api/email/retained@example.com/graph-detail-1?method=graph&folder=inbox&id_mode=graph'
@@ -1349,7 +1440,11 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'true',
             ))
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=graph_detail) as detail_mock, \
+        with patch.object(
+            web_outlook_app,
+            'get_email_detail_graph_result',
+            return_value={'success': True, 'detail': graph_detail},
+        ) as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=attachments) as attachments_mock:
             response = self.client.get(
                 '/api/email/retained@example.com/graph-detail-1?method=graph&folder=inbox&id_mode=graph'
@@ -1377,7 +1472,11 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'true',
             ))
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=graph_detail) as detail_mock, \
+        with patch.object(
+            web_outlook_app,
+            'get_email_detail_graph_result',
+            return_value={'success': True, 'detail': graph_detail},
+        ) as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=attachments) as attachments_mock:
             response = self.client.get(
                 '/api/email/retained@example.com/graph-detail-1'
@@ -1407,7 +1506,11 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'false',
             ))
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=graph_detail) as detail_mock, \
+        with patch.object(
+            web_outlook_app,
+            'get_email_detail_graph_result',
+            return_value={'success': True, 'detail': graph_detail},
+        ) as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=[]) as attachments_mock:
             response = self.client.get(
                 '/api/email/retained@example.com/cached-detail-1'
@@ -1431,8 +1534,8 @@ class NormalMailRetentionTests(unittest.TestCase):
                 'true',
             ))
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph') as graph_mock, \
-             patch.object(web_outlook_app, 'get_email_detail_imap') as oauth_imap_mock, \
+        with patch.object(web_outlook_app, 'get_email_detail_graph_result') as graph_mock, \
+             patch.object(web_outlook_app, 'get_email_detail_imap_result') as oauth_imap_mock, \
              patch.object(web_outlook_app, 'get_email_detail_imap_generic_result') as generic_imap_mock:
             graph_mock.side_effect = AssertionError('Graph detail helper should not be called')
             oauth_imap_mock.side_effect = AssertionError('OAuth IMAP detail helper should not be called')
@@ -1462,6 +1565,69 @@ class NormalMailRetentionTests(unittest.TestCase):
         oauth_imap_mock.assert_not_called()
         generic_imap_mock.assert_not_called()
 
+    def test_prefer_local_detail_falls_back_when_attachment_metadata_is_missing(self):
+        self._seed_cached_detail_row_with_attachment_metadata('graph-detail-1', True, [])
+        graph_detail = self._graph_detail_payload()
+        attachments = self._graph_attachment_payload()
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting(
+                'normal_mail_local_retention_enabled',
+                'true',
+            ))
+
+        with patch.object(
+            web_outlook_app,
+            'get_email_detail_graph_result',
+            return_value={'success': True, 'detail': graph_detail},
+        ) as detail_mock, \
+             patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=attachments) as attachments_mock:
+            response = self.client.get(
+                '/api/email/retained@example.com/graph-detail-1'
+                '?prefer_local=1&method=graph&folder=inbox&id_mode=graph'
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertNotEqual(payload.get('source'), 'local_retention')
+        self.assertFalse(payload.get('local_retention', False))
+        self.assertEqual(payload['email']['attachments'], attachments)
+        detail_mock.assert_called_once()
+        attachments_mock.assert_called_once()
+
+        rows = self._retained_detail_rows()
+        self.assertEqual(len(rows), 1)
+        self._assert_graph_detail_retained(rows[0], attachments)
+
+    def test_prefer_local_detail_without_attachments_still_uses_cached_body(self):
+        self._seed_cached_detail_row_with_attachment_metadata('cached-no-attachments-1', False, [])
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting(
+                'normal_mail_local_retention_enabled',
+                'true',
+            ))
+
+        with patch.object(web_outlook_app, 'get_email_detail_graph_result') as graph_mock, \
+             patch.object(web_outlook_app, 'get_email_detail_imap_result') as oauth_imap_mock, \
+             patch.object(web_outlook_app, 'get_email_detail_imap_generic_result') as generic_imap_mock:
+            graph_mock.side_effect = AssertionError('Graph detail helper should not be called')
+            oauth_imap_mock.side_effect = AssertionError('OAuth IMAP detail helper should not be called')
+            generic_imap_mock.side_effect = AssertionError('Generic IMAP detail helper should not be called')
+            response = self.client.get(
+                '/api/email/retained@example.com/cached-no-attachments-1'
+                '?prefer_local=1&folder=inbox&id_mode=graph'
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['source'], 'local_retention')
+        self.assertEqual(payload['email']['attachments'], [])
+        self.assertFalse(payload['email']['has_attachments'])
+        graph_mock.assert_not_called()
+        oauth_imap_mock.assert_not_called()
+        generic_imap_mock.assert_not_called()
+
     def test_retain_bodies_api_rejects_disabled_retention_without_fetching_detail(self):
         items = [
             {'id': 'retain-disabled-1', 'folder': 'inbox', 'id_mode': 'graph', 'method': 'graph'},
@@ -1473,7 +1639,7 @@ class NormalMailRetentionTests(unittest.TestCase):
             ))
             web_outlook_app.upsert_retained_normal_mail_list_items(self.account, 'inbox', items)
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph') as detail_mock, \
+        with patch.object(web_outlook_app, 'get_email_detail_graph_result') as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph') as attachments_mock:
             response = self.client.post(
                 '/api/emails/retain-bodies',
@@ -1511,17 +1677,20 @@ class NormalMailRetentionTests(unittest.TestCase):
 
         def graph_detail(client_id, refresh_token, message_id, proxy_url, fallback_proxy_urls):
             return {
-                'id': message_id,
-                'subject': f'Detail {message_id}',
-                'from': {'emailAddress': {'address': f'{message_id}@example.com'}},
-                'toRecipients': [{'emailAddress': {'address': 'reader@example.com'}}],
-                'ccRecipients': [],
-                'receivedDateTime': '2026-05-27T05:00:00Z',
-                'hasAttachments': False,
-                'body': {'contentType': 'html', 'content': f'<p>Body {message_id}</p>'},
+                'success': True,
+                'detail': {
+                    'id': message_id,
+                    'subject': f'Detail {message_id}',
+                    'from': {'emailAddress': {'address': f'{message_id}@example.com'}},
+                    'toRecipients': [{'emailAddress': {'address': 'reader@example.com'}}],
+                    'ccRecipients': [],
+                    'receivedDateTime': '2026-05-27T05:00:00Z',
+                    'hasAttachments': False,
+                    'body': {'contentType': 'html', 'content': f'<p>Body {message_id}</p>'},
+                },
             }
 
-        with patch.object(web_outlook_app, 'get_email_detail_graph', side_effect=graph_detail) as detail_mock, \
+        with patch.object(web_outlook_app, 'get_email_detail_graph_result', side_effect=graph_detail) as detail_mock, \
              patch.object(web_outlook_app, 'get_email_attachments_graph', return_value=[]) as attachments_mock:
             response = self.client.post(
                 '/api/emails/retain-bodies',
